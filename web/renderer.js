@@ -82,6 +82,18 @@ class Pane {
     });
     this.el.appendChild(closeBtn);
 
+    // 💾 save button (left of ✕): downloads this terminal's text as a .txt file.
+    const saveBtn = document.createElement("div");
+    saveBtn.className = "pane-save";
+    saveBtn.textContent = "💾";
+    saveBtn.title = "Save this terminal's text to a file";
+    saveBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+    saveBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      this.saveToFile();
+    });
+    this.el.appendChild(saveBtn);
+
     this.term = new Terminal({
       cursorBlink: true,
       fontSize: 14,
@@ -277,6 +289,34 @@ class Pane {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
     }
+  }
+
+  // Read everything in this terminal — scrollback plus the visible screen — as
+  // plain text, with trailing blank lines trimmed off.
+  getAllText() {
+    const buf = this.term.buffer.active;
+    const lines = [];
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      lines.push(line ? line.translateToString(true) : "");
+    }
+    while (lines.length && lines[lines.length - 1].trim() === "") lines.pop();
+    return lines.join("\r\n");
+  }
+
+  // Download this terminal's full text as a timestamped .txt file.
+  saveToFile() {
+    const text = this.getAllText();
+    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `terminal-${stamp}.txt`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   // Copy whatever is currently selected in this terminal to the clipboard.

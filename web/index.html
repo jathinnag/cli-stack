@@ -347,6 +347,28 @@
       /* When there's only one terminal, you can't close it — hide the ✕. */
       #grid.single .pane-close { display: none; }
 
+      /* 💾 save-to-file button, sits just left of the ✕ (same hover behavior) */
+      .pane-save {
+        position: absolute;
+        top: 4px;
+        right: 28px;
+        width: 18px;
+        height: 18px;
+        line-height: 18px;
+        text-align: center;
+        background: rgba(40, 40, 40, 0.7);
+        border-radius: 4px;
+        font-size: 11px;
+        cursor: pointer;
+        z-index: 5;
+        opacity: 0;
+        transition: opacity 0.1s;
+      }
+      .pane:hover .pane-save { opacity: 1; }
+      .pane-save:hover { background: #2d6cdf; }
+      /* With one terminal the ✕ is hidden, so move save into its spot. */
+      #grid.single .pane-save { right: 6px; }
+
       /* Right-click menu */
       .context-menu {
         position: fixed;
