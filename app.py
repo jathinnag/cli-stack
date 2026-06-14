@@ -261,6 +261,100 @@ def unsave_dir():
     return {"ok": True}
 
 
+# ---- Terminal sessions ----
+# A session is one real shell process, kept ALIVE independently of any single
+# WebSocket. When the browser's socket drops (system sleep, tab throttling, a
+# network blip) the shell keeps running; output produced meanwhile is buffered,
+# and the page reconnects with the same session id to pick up right where it
+# left off. Shells are only torn down on an explicit pane close or after a
+# disconnected session has waited out the grace period below.
+SESSION_GRACE = 60 * 60      # keep a disconnected shell resumable this long (s)
+PENDING_CAP = 256 * 1024     # max characters of missed output buffered per shell
+_sessions = {}               # sid -> _Session
+_sessions_lock = threading.Lock()
+
+
+class _Session:
+    def __init__(self, sid, pty):
+        self.sid = sid
+        self.pty = pty
+        self.lock = threading.Lock()  # serializes all sends + attach/detach
+        self.ws = None                # the currently attached socket, or None
+        self.pending = []             # output collected while detached
+        self.pending_chars = 0
+        self.alive = True
+        self.detached_at = time.time()
+
+
+def _pump_session(sess):
+    """One per shell: forward output to the attached socket, or buffer it."""
+    while True:
+        try:
+            data = sess.pty.read()  # blocks until the shell prints something
+        except Exception:
+            break  # EOFError / pty gone -> shell ended
+        if not data:
+            continue
+        with sess.lock:
+            if sess.ws is not None:
+                try:
+                    sess.ws.send(data)
+                    continue
+                except Exception:
+                    sess.ws = None  # socket broke; buffer this chunk instead
+                    sess.detached_at = time.time()
+            sess.pending.append(data)
+            sess.pending_chars += len(data)
+            # Trim the oldest buffered output so a long detach can't grow forever.
+            while sess.pending_chars > PENDING_CAP and len(sess.pending) > 1:
+                sess.pending_chars -= len(sess.pending.pop(0))
+
+    # The shell exited — tell whoever is watching and forget the session.
+    sess.alive = False
+    with sess.lock:
+        if sess.ws is not None:
+            try:
+                sess.ws.send("\r\n\x1b[31m[session ended]\x1b[0m\r\n")
+            except Exception:
+                pass
+    with _sessions_lock:
+        _sessions.pop(sess.sid, None)
+
+
+def _kill_session(sid):
+    """Tear a shell down for good (explicit pane close, or the reaper)."""
+    with _sessions_lock:
+        sess = _sessions.pop(sid, None)
+    if sess is None:
+        return
+    sess.alive = False
+    try:
+        if sess.pty.isalive():
+            sess.pty.terminate(force=True)
+    except Exception:
+        pass
+    with sess.lock:
+        ws, sess.ws = sess.ws, None
+    if ws is not None:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+
+def _reap_sessions():
+    """Periodically retire shells that have been disconnected past the grace
+    period (e.g. the app window was closed and never came back)."""
+    while True:
+        time.sleep(60)
+        now = time.time()
+        for sid, sess in list(_sessions.items()):
+            if not sess.alive or (
+                sess.ws is None and now - sess.detached_at > SESSION_GRACE
+            ):
+                _kill_session(sid)
+
+
 # ---- The live connection between the page and a real shell ----
 
 @sock.route("/ws")
@@ -270,78 +364,97 @@ def terminal_socket(ws):
     if request.host not in ALLOWED_HOSTS or not _authed():
         return
 
-    # The page sends a "start" message first, telling us which folder to
-    # launch the shell in (chosen via the buttons on a fresh terminal).
-    cwd = None
+    # The page sends a "start" message first: its session id (so we can resume
+    # an existing shell) and, for a brand-new shell, the folder to launch in.
     first = ws.receive()
     if first is None:
         return  # window closed before it started
     try:
         start = json.loads(first)
-        if start.get("type") == "start":
-            cwd = start.get("cwd") or None
     except Exception:
-        pass
-    if cwd and not os.path.isdir(cwd):
-        cwd = None  # fall back to the default if the path is bad
-
-    # Each window gets its own real shell process, rooted at the chosen folder.
-    # SPAWN also wires up the in-terminal `save` command (see _build_spawn).
-    try:
-        pty = PtyProcess.spawn(SPAWN, cwd=cwd, dimensions=(24, 80))
-    except Exception as e:
-        # Couldn't start the shell — tell the user instead of just closing.
-        traceback.print_exc()
-        try:
-            ws.send(f"\r\n\x1b[31mFailed to start shell: {e}\x1b[0m\r\n")
-        except Exception:
-            pass
         return
+    if not isinstance(start, dict) or start.get("type") != "start":
+        return
+    sid = start.get("sid") or secrets.token_urlsafe(9)
 
-    # Background thread: shell output -> browser.
-    def pump_output():
-        while True:
+    # Resume the matching live shell if we still have it; otherwise start one.
+    with _sessions_lock:
+        sess = _sessions.get(sid)
+        if sess is not None and not sess.alive:
+            _sessions.pop(sid, None)
+            sess = None
+
+    if sess is None:
+        cwd = start.get("cwd") or None
+        if cwd and not os.path.isdir(cwd):
+            cwd = None  # fall back to the default if the path is bad
+        # SPAWN also wires up the in-terminal `save` command (see _build_spawn).
+        try:
+            pty = PtyProcess.spawn(SPAWN, cwd=cwd, dimensions=(24, 80))
+        except Exception as e:
+            traceback.print_exc()
             try:
-                data = pty.read()  # waits for the shell to print something
-            except EOFError:
-                break  # shell closed
+                ws.send(f"\r\n\x1b[31mFailed to start shell: {e}\x1b[0m\r\n")
             except Exception:
-                break  # pty gone
+                pass
+            return
+        sess = _Session(sid, pty)
+        with _sessions_lock:
+            _sessions[sid] = sess
+        threading.Thread(target=_pump_session, args=(sess,), daemon=True).start()
+
+    # Attach this socket and flush anything the shell printed while detached.
+    with sess.lock:
+        sess.ws = ws
+        if sess.pending:
+            missed = "".join(sess.pending)
+            sess.pending = []
+            sess.pending_chars = 0
             try:
-                ws.send(data)
+                ws.send(missed)
             except Exception:
-                break  # browser/window closed
+                sess.ws = None
 
-    threading.Thread(target=pump_output, daemon=True).start()
-
-    # This loop: messages from the browser -> shell. A bad/unknown message must
-    # never kill the connection, so each one is parsed and applied defensively.
+    # Messages from the browser -> shell. A bad/unknown message must never kill
+    # the connection, so each one is parsed and applied defensively.
     try:
         while True:
             message = ws.receive()
             if message is None:
-                break  # window closed
+                break  # socket closed
             try:
                 msg = json.loads(message)
             except Exception:
                 continue  # ignore anything that isn't a JSON command
             kind = msg.get("type")
             if kind == "input":
-                pty.write(msg.get("data", ""))
+                sess.pty.write(msg.get("data", ""))
             elif kind == "resize":
                 try:
-                    pty.setwinsize(int(msg["rows"]), int(msg["cols"]))
+                    sess.pty.setwinsize(int(msg["rows"]), int(msg["cols"]))
                 except Exception:
                     pass  # ignore bad/transient resize values
-    except Exception:
-        # Browser closed mid-read, or the pty died — fall through to cleanup.
-        traceback.print_exc()
+    except Exception as e:
+        # A dropped connection (ConnectionClosed) is normal — don't make noise.
+        if e.__class__.__name__ != "ConnectionClosed":
+            traceback.print_exc()
     finally:
-        try:
-            if pty.isalive():
-                pty.terminate(force=True)
-        except Exception:
-            pass
+        # Detach, but leave the shell running so the page can resume it later.
+        with sess.lock:
+            if sess.ws is ws:
+                sess.ws = None
+                sess.detached_at = time.time()
+
+
+@app.route("/close-session", methods=["POST"])
+def close_session():
+    # The page calls this when a pane is genuinely closed, so we can stop the
+    # shell instead of keeping it around for a resume that will never come.
+    data = request.get_json(silent=True) or {}
+    sid = data.get("sid")
+    if sid:
+        _kill_session(sid)
+    return {"ok": True}
 
 
 # ---- Open the page as its own window ----
@@ -365,4 +478,5 @@ def open_window():
 if __name__ == "__main__":
     print(f"cli-stack running. Opening a window... (server at http://{HOST}:{PORT})")
     threading.Thread(target=open_window, daemon=True).start()
+    threading.Thread(target=_reap_sessions, daemon=True).start()
     app.run(host=HOST, port=PORT, threaded=True)

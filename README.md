@@ -15,6 +15,11 @@ draws the terminal in an app-mode browser window — so interactive programs
   folder (or `save <path>` for a specific one). Saved folders then appear in the
   chooser for every new terminal, with a ✕ to forget them.
 - **Copy / paste** — select to copy, middle-click or right-click to paste.
+- **Resume after disconnects** — shells run independently of the browser socket,
+  so if it drops (system sleep, a backgrounded tab, a network blip) the page
+  reconnects automatically and picks up the same shell, replaying any output it
+  missed. Closing a pane stops its shell; a shell left disconnected is retired
+  after an hour.
 
 ## Run
 

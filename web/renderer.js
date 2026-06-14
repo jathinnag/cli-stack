@@ -99,6 +99,15 @@ class Pane {
     this.ws = null;
     this.startCwd = "";
 
+    // A stable id for this pane's shell. The server keeps the shell alive
+    // across socket drops, so when we reconnect with the same id we resume the
+    // very same session instead of getting a fresh shell.
+    this.sid = newSessionId();
+    this.closing = false;       // true once the pane is genuinely closed
+    this.reconnecting = false;  // true while we're trying to re-attach
+    this.reconnectDelay = 500;  // backoff between reconnect attempts (ms)
+    this.reconnectTimer = null;
+
     this.term.onData((data) => this.send({ type: "input", data }));
 
     this.el.addEventListener("focusin", () => setActive(this));
@@ -227,15 +236,32 @@ class Pane {
   }
 
   // Open this pane's own live connection to the Python server -> its own shell.
+  // If the socket later drops (sleep, throttling, a blip) we automatically
+  // reconnect with the same session id and resume the same shell.
   connect() {
     this.ws = new WebSocket(`ws://${location.host}/ws`);
     this.ws.onopen = () => {
-      this.send({ type: "start", cwd: this.startCwd }); // first message picks the folder
+      // The session id resumes an existing shell; cwd only matters for a new one.
+      this.send({ type: "start", sid: this.sid, cwd: this.startCwd });
       this.resize();
       this.term.focus();
+      if (this.reconnecting) {
+        this.reconnecting = false;
+        this.term.write("\x1b[32m[reconnected]\x1b[0m\r\n");
+      }
+      this.reconnectDelay = 500; // reset backoff after a good connection
     };
     this.ws.onmessage = (event) => this.term.write(event.data);
-    this.ws.onclose = () => this.term.write("\r\n\x1b[31m[closed]\x1b[0m");
+    this.ws.onclose = () => {
+      this.ws = null;
+      if (this.closing) return; // pane was closed on purpose — don't reconnect
+      if (!this.reconnecting) {
+        this.reconnecting = true;
+        this.term.write("\r\n\x1b[33m[connection lost — reconnecting…]\x1b[0m");
+      }
+      this.reconnectTimer = setTimeout(() => this.connect(), this.reconnectDelay);
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, 5000);
+    };
   }
 
   resize() {
@@ -276,11 +302,34 @@ class Pane {
   }
 
   dispose() {
+    // This is a real close, so stop the shell on the server (otherwise it would
+    // be kept alive for a resume that will never come) and don't reconnect.
+    this.closing = true;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.sid) {
+      try {
+        fetch("/close-session", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sid: this.sid }),
+          keepalive: true, // still sent even if the page is unloading
+        });
+      } catch (e) { /* best effort */ }
+    }
     this.observer.disconnect();
     try { if (this.ws) this.ws.close(); } catch (e) {}
     this.term.dispose();
     this.el.remove();
   }
+}
+
+// A random session id for a pane's shell (resilient to socket drops). Uses the
+// browser's UUID generator when available, with a simple fallback.
+function newSessionId() {
+  try {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  } catch (e) { /* fall through */ }
+  return "s-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
 }
 
 function setActive(pane) {
