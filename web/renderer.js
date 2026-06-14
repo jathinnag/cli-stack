@@ -126,10 +126,10 @@ class Pane {
     this.observer = new ResizeObserver(() => this.resize());
     this.observer.observe(this.el);
 
-    // For now, skip the folder chooser and just start in the present folder.
-    // (The chooser code below is kept — replace the next line with
-    // `this.showStartChooser()` to bring the buttons back.)
-    this.start(""); // "" => the app's launch folder
+    // Show the folder chooser so the user can start here, in a saved folder,
+    // or in a recent one. (To always start in the launch folder instead,
+    // replace the next line with `this.start("")`.)
+    this.showStartChooser();
   }
 
   // Overlay shown on a brand-new terminal: pick where the shell should start.
@@ -156,51 +156,65 @@ class Pane {
       btnThis.appendChild(path);
     });
 
-    const btnOther = document.createElement("button");
-    btnOther.className = "start-btn";
-    btnOther.textContent = "Other directory (recent)";
+    // Folders the user kept with the `save` command, shown up front so they're
+    // one click away. Each row starts a terminal there; its ✕ forgets it.
+    const savedSection = document.createElement("div");
+    savedSection.className = "saved-section hidden";
+    const savedHeading = document.createElement("div");
+    savedHeading.className = "section-heading";
+    savedHeading.textContent = "Saved folders";
+    const savedList = document.createElement("div");
+    savedList.className = "recent-list"; // reuse the recent-list styling
+    savedSection.append(savedHeading, savedList);
 
-    // A list of previously-used folders, revealed when "recent" is clicked.
-    const recentList = document.createElement("div");
-    recentList.className = "recent-list hidden";
-
-    btnOther.addEventListener("click", async () => {
-      // Toggle the list closed if it's already open.
-      if (!recentList.classList.contains("hidden")) {
-        recentList.classList.add("hidden");
-        return;
-      }
-      recentList.innerHTML = "";
-      recentList.classList.remove("hidden");
-
+    const refreshSaved = async () => {
       let dirs = [];
       try {
-        dirs = (await fetch("/recent-dirs").then((r) => r.json())).dirs || [];
+        dirs = (await fetch("/saved-dirs").then((r) => r.json())).dirs || [];
       } catch (e) {
-        /* fetch failed — show the empty note below */
+        /* fetch failed — leave the section hidden */
       }
-      // The launch folder already has its own "This directory" button.
-      const def = await defaultDir();
-      dirs = dirs.filter((d) => d.toLowerCase() !== (def || "").toLowerCase());
-
+      savedList.innerHTML = "";
       if (dirs.length === 0) {
-        const empty = document.createElement("div");
-        empty.className = "recent-empty";
-        empty.textContent = "No other recent folders yet.";
-        recentList.appendChild(empty);
+        savedSection.classList.add("hidden");
         return;
       }
+      savedSection.classList.remove("hidden");
       dirs.forEach((dir) => {
-        const item = document.createElement("button");
-        item.className = "recent-item";
-        item.textContent = dir;
-        item.title = dir;
-        item.addEventListener("click", () => this.start(dir));
-        recentList.appendChild(item);
-      });
-    });
+        const item = document.createElement("div");
+        item.className = "recent-item saved-item";
 
-    overlay.append(title, btnThis, btnOther, recentList);
+        const label = document.createElement("span");
+        label.className = "saved-item-path";
+        label.textContent = dir;
+        label.title = dir;
+        label.addEventListener("click", () => this.start(dir));
+
+        const remove = document.createElement("span");
+        remove.className = "saved-remove";
+        remove.textContent = "✕";
+        remove.title = "Remove from saved";
+        remove.addEventListener("click", async (e) => {
+          e.stopPropagation();
+          try {
+            await fetch("/unsave-dir", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ path: dir }),
+            });
+          } catch (e) {
+            /* ignore — refresh will still re-read the list */
+          }
+          refreshSaved();
+        });
+
+        item.append(label, remove);
+        savedList.appendChild(item);
+      });
+    };
+    refreshSaved();
+
+    overlay.append(title, btnThis, savedSection);
     this.el.appendChild(overlay);
     this.overlay = overlay;
   }

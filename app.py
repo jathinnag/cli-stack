@@ -9,14 +9,17 @@ How it works:
     so it looks and feels like its own application.
 """
 
+import base64
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import traceback
 
-from flask import Flask, send_from_directory
+from flask import Flask, request, send_from_directory
 from flask_sock import Sock
 
 # Pick the right pty engine + shell for the operating system.
@@ -31,11 +34,70 @@ HOST = "127.0.0.1"
 PORT = 8000
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 
-# Where we remember folders terminals have been started in, so the "choose"
-# button can offer them again. Kept in the home folder (survives restarts).
-RECENTS_FILE = os.path.join(os.path.expanduser("~"), ".cli-stack-recents.json")
-RECENTS_MAX = 12
-_recents_lock = threading.Lock()
+# Folders the user has explicitly kept with the "save" command typed in a
+# terminal. They are never auto-added or auto-evicted — they stay until the
+# user removes them, and the folder chooser lists them.
+SAVED_FILE = os.path.join(os.path.expanduser("~"), ".cli-stack-saved.json")
+SAVED_MAX = 50
+_saved_lock = threading.Lock()
+
+# The URL the in-terminal `save` command posts the current folder to.
+SAVE_URL = f"http://{HOST}:{PORT}/save-dir"
+
+
+def _build_spawn():
+    """The command used to launch each shell.
+
+    We define a `save` command/function inside the shell so the user can type
+    `save` (or `save <path>`) in any terminal to remember its current folder.
+    The function just POSTs the current directory back to this server."""
+    if sys.platform == "win32":
+        # Define the function silently at startup, then stay interactive
+        # (-NoExit). -EncodedCommand sidesteps all the quoting headaches.
+        ps = (
+            "function save {\r\n"
+            "  param([string]$Path)\r\n"
+            "  if (-not $Path) { $Path = (Get-Location).Path }\r\n"
+            "  try { $full = (Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path }"
+            " catch { $full = $Path }\r\n"
+            "  try {\r\n"
+            f"    Invoke-RestMethod -Uri '{SAVE_URL}' -Method Post"
+            " -Body (@{ path = $full } | ConvertTo-Json) -ContentType 'application/json'"
+            " -TimeoutSec 5 | Out-Null\r\n"
+            '    Write-Host "Saved to cli-stack: $full" -ForegroundColor Green\r\n'
+            "  } catch {\r\n"
+            '    Write-Host "cli-stack save failed: $($_.Exception.Message)" -ForegroundColor Red\r\n'
+            "  }\r\n"
+            "}\r\n"
+        )
+        encoded = base64.b64encode(ps.encode("utf-16-le")).decode("ascii")
+        return f"{SHELL} -NoLogo -NoExit -EncodedCommand {encoded}"
+
+    # POSIX: only bash gets the convenience function (via a throwaway rcfile
+    # that still loads the user's own ~/.bashrc). Other shells fall back to a
+    # plain launch — the /save-dir endpoint still works if called directly.
+    if os.path.basename(SHELL).startswith("bash"):
+        rc = os.path.join(tempfile.gettempdir(), "cli-stack-bashrc.sh")
+        body = '''[ -f ~/.bashrc ] && . ~/.bashrc
+save() {
+  local p="${1:-$PWD}"
+  p="$(cd "$p" 2>/dev/null && pwd || echo "$p")"
+  if command -v curl >/dev/null 2>&1; then
+    curl -s -X POST -H 'Content-Type: application/json' -d "{\\"path\\":\\"$p\\"}" '__URL__' >/dev/null
+  fi
+  echo "Saved to cli-stack: $p"
+}
+'''.replace("__URL__", SAVE_URL)
+        try:
+            with open(rc, "w", encoding="utf-8") as f:
+                f.write(body)
+            return [SHELL, "--rcfile", rc, "-i"]
+        except Exception:
+            return SHELL
+    return SHELL
+
+
+SPAWN = _build_spawn()
 
 app = Flask(__name__, static_folder=None)
 sock = Sock(app)
@@ -68,41 +130,79 @@ def _same_path(a, b):
     return a == b
 
 
-def load_recents():
-    """Read the saved recent folders (most-recent-first); [] on any problem."""
+# ---- Folders the user explicitly saved (via the "save" command) ----
+
+def load_saved():
+    """Read the user's saved folders (most-recent-first); [] on any problem."""
     try:
-        with open(RECENTS_FILE, "r", encoding="utf-8") as f:
+        with open(SAVED_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return [p for p in data if isinstance(p, str)]
     except Exception:
         return []
 
 
-def add_recent(path):
-    """Record a folder a terminal was started in: move it to the front of the
-    recents list, de-duplicated, capped at RECENTS_MAX."""
+def add_saved(path):
+    """Remember a folder the user saved: move it to the front of the saved
+    list, de-duplicated, capped at SAVED_MAX. Returns the absolute path on
+    success, or None if it wasn't a real folder."""
     try:
         path = os.path.abspath(path)
     except Exception:
-        return
+        return None
     if not os.path.isdir(path):
-        return
-    with _recents_lock:
-        items = [p for p in load_recents() if not _same_path(p, path)]
+        return None
+    with _saved_lock:
+        items = [p for p in load_saved() if not _same_path(p, path)]
         items.insert(0, path)
-        items = items[:RECENTS_MAX]
+        items = items[:SAVED_MAX]
         try:
-            with open(RECENTS_FILE, "w", encoding="utf-8") as f:
+            with open(SAVED_FILE, "w", encoding="utf-8") as f:
+                json.dump(items, f)
+        except Exception:
+            pass
+    return path
+
+
+def remove_saved(path):
+    """Forget a saved folder (used by the chooser's ✕ button)."""
+    with _saved_lock:
+        items = [p for p in load_saved() if not _same_path(p, path)]
+        try:
+            with open(SAVED_FILE, "w", encoding="utf-8") as f:
                 json.dump(items, f)
         except Exception:
             pass
 
 
-@app.route("/recent-dirs")
-def recent_dirs():
-    # Only offer folders that still exist.
-    dirs = [p for p in load_recents() if os.path.isdir(p)]
+@app.route("/saved-dirs")
+def saved_dirs():
+    # Only offer folders that still exist on disk.
+    dirs = [p for p in load_saved() if os.path.isdir(p)]
     return {"dirs": dirs}
+
+
+@app.route("/save-dir", methods=["POST"])
+def save_dir():
+    # Called by the `save` command running inside a terminal: it sends the
+    # shell's current folder, which we add to the saved list.
+    data = request.get_json(silent=True) or {}
+    path = data.get("path")
+    if not path:
+        return {"ok": False, "error": "no path"}, 400
+    saved = add_saved(path)
+    if not saved:
+        return {"ok": False, "error": "not a folder"}, 400
+    return {"ok": True, "dir": saved}
+
+
+@app.route("/unsave-dir", methods=["POST"])
+def unsave_dir():
+    data = request.get_json(silent=True) or {}
+    path = data.get("path")
+    if path:
+        remove_saved(path)
+    return {"ok": True}
 
 
 # ---- The live connection between the page and a real shell ----
@@ -124,12 +224,18 @@ def terminal_socket(ws):
     if cwd and not os.path.isdir(cwd):
         cwd = None  # fall back to the default if the path is bad
 
-    # The folder the shell actually opens in (the launch dir when unspecified).
-    effective_cwd = cwd or os.getcwd()
-    add_recent(effective_cwd)
-
     # Each window gets its own real shell process, rooted at the chosen folder.
-    pty = PtyProcess.spawn(SHELL, cwd=cwd, dimensions=(24, 80))
+    # SPAWN also wires up the in-terminal `save` command (see _build_spawn).
+    try:
+        pty = PtyProcess.spawn(SPAWN, cwd=cwd, dimensions=(24, 80))
+    except Exception as e:
+        # Couldn't start the shell — tell the user instead of just closing.
+        traceback.print_exc()
+        try:
+            ws.send(f"\r\n\x1b[31mFailed to start shell: {e}\x1b[0m\r\n")
+        except Exception:
+            pass
+        return
 
     # Background thread: shell output -> browser.
     def pump_output():
@@ -138,25 +244,43 @@ def terminal_socket(ws):
                 data = pty.read()  # waits for the shell to print something
             except EOFError:
                 break  # shell closed
+            except Exception:
+                break  # pty gone
             try:
                 ws.send(data)
             except Exception:
                 break  # browser/window closed
+
     threading.Thread(target=pump_output, daemon=True).start()
 
-    # This loop: messages from the browser -> shell.
-    while True:
-        message = ws.receive()
-        if message is None:
-            break  # window closed
-        msg = json.loads(message)
-        if msg["type"] == "input":
-            pty.write(msg["data"])
-        elif msg["type"] == "resize":
-            pty.setwinsize(msg["rows"], msg["cols"])
-
-    if pty.isalive():
-        pty.terminate(force=True)
+    # This loop: messages from the browser -> shell. A bad/unknown message must
+    # never kill the connection, so each one is parsed and applied defensively.
+    try:
+        while True:
+            message = ws.receive()
+            if message is None:
+                break  # window closed
+            try:
+                msg = json.loads(message)
+            except Exception:
+                continue  # ignore anything that isn't a JSON command
+            kind = msg.get("type")
+            if kind == "input":
+                pty.write(msg.get("data", ""))
+            elif kind == "resize":
+                try:
+                    pty.setwinsize(int(msg["rows"]), int(msg["cols"]))
+                except Exception:
+                    pass  # ignore bad/transient resize values
+    except Exception:
+        # Browser closed mid-read, or the pty died — fall through to cleanup.
+        traceback.print_exc()
+    finally:
+        try:
+            if pty.isalive():
+                pty.terminate(force=True)
+        except Exception:
+            pass
 
 
 # ---- Open the page as its own window ----

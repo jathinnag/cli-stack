@@ -290,12 +290,39 @@
         white-space: nowrap;
       }
       .recent-item:hover { border-color: #fff; color: #fff; }
-      .recent-empty {
-        color: #777;
-        font-size: 12px;
-        text-align: center;
-        padding: 6px;
+
+      /* ---- Saved folders section (filled by the `save` command) ---- */
+      .saved-section {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        width: 300px;
       }
+      .saved-section.hidden { display: none; }
+      .section-heading {
+        align-self: flex-start;
+        color: #888;
+        font-size: 10px;
+        letter-spacing: 0.6px;
+        text-transform: uppercase;
+      }
+      /* A saved row = clickable path on the left + ✕ remove on the right. */
+      .saved-item { display: flex; align-items: center; gap: 8px; }
+      .saved-item-path {
+        flex: 1;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .saved-remove {
+        flex: 0 0 auto;
+        color: #888;
+        font-size: 11px;
+        line-height: 1;
+        padding: 2px 4px;
+        border-radius: 4px;
+      }
+      .saved-remove:hover { background: #c0392b; color: #fff; }
 
       /* ✕ close button, shown when hovering a pane */
       .pane-close {
