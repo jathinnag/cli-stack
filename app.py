@@ -12,6 +12,7 @@ How it works:
 import base64
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -261,6 +262,102 @@ def unsave_dir():
     return {"ok": True}
 
 
+# ---- Session logging ----
+# Every session is transcribed to a plain-text log inside the folder it opened
+# in: <folder>/context/logs/session-<timestamp>.log. The shell stream is full of
+# ANSI color/cursor escapes, so we strip those to keep the log readable. It's a
+# best-effort transcript — interactive line redraws (e.g. PowerShell's
+# PSReadLine) can still leave minor artifacts.
+_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")   # OSC ... BEL / ST
+_CSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")           # CSI ... final byte
+_ESC = re.compile(r"\x1b[@-Z\\-_]")                        # other 2-char escapes
+_CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")    # stray control chars
+
+
+def _strip_ansi(text):
+    text = _OSC.sub("", text)
+    text = _CSI.sub("", text)
+    text = _ESC.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "")
+    return _CTRL.sub("", text)
+
+
+def _open_session_log(base_dir):
+    """Create <base_dir>/context/logs/ and open a fresh transcript file there."""
+    try:
+        logs_dir = os.path.join(base_dir, "context", "logs")
+        os.makedirs(logs_dir, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(logs_dir, f"session-{stamp}-{secrets.token_hex(2)}.log")
+        f = open(path, "a", encoding="utf-8", errors="replace")
+        f.write(
+            "# cli-stack session log\n"
+            f"# started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"# folder:  {base_dir}\n\n"
+        )
+        f.flush()
+        return f
+    except Exception:
+        traceback.print_exc()
+        return None  # logging is best-effort; the terminal still works
+
+
+def _emit_line(sess, line):
+    """Write one finished transcript line, collapsing keystroke redraws: if the
+    previous line is just a shorter prefix of this one (how PSReadLine repaints
+    a line as you type), it was a partial redraw, so drop it and keep this one."""
+    prev = sess.pending_line
+    if prev is not None and not (line.startswith(prev) and line != prev):
+        sess.logfile.write(prev + "\n")
+    sess.pending_line = line
+
+
+def _log_write(sess, data):
+    """Transcribe shell output: strip escapes (holding back a trailing partial
+    one across read boundaries), then emit complete lines with redraw-collapse."""
+    f = sess.logfile
+    if not f:
+        return
+    try:
+        buf = sess.logbuf + data
+        idx = buf.rfind("\x1b")
+        if idx != -1 and len(buf) - idx < 16:  # likely an unfinished escape
+            out, sess.logbuf = buf[:idx], buf[idx:]
+        else:
+            out, sess.logbuf = buf, ""
+        if not out:
+            return
+        sess.lineacc += _strip_ansi(out)
+        lines = sess.lineacc.split("\n")
+        sess.lineacc = lines.pop()  # last piece has no newline yet — keep it
+        for line in lines:
+            _emit_line(sess, line)
+        f.flush()
+    except Exception:
+        pass
+
+
+def _close_session_log(sess):
+    f = sess.logfile
+    if not f:
+        return
+    sess.logfile = None
+    try:
+        # Flush anything still buffered (incomplete escape, partial line, the
+        # last pending line) before stamping the end time.
+        tail = _strip_ansi(sess.logbuf) + sess.lineacc
+        sess.logbuf = sess.lineacc = ""
+        for line in tail.split("\n"):
+            _emit_line(sess, line)
+        if sess.pending_line is not None:
+            f.write(sess.pending_line + "\n")
+            sess.pending_line = None
+        f.write(f"\n# ended: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.close()
+    except Exception:
+        pass
+
+
 # ---- Terminal sessions ----
 # A session is one real shell process, kept ALIVE independently of any single
 # WebSocket. When the browser's socket drops (system sleep, tab throttling, a
@@ -275,7 +372,7 @@ _sessions_lock = threading.Lock()
 
 
 class _Session:
-    def __init__(self, sid, pty):
+    def __init__(self, sid, pty, logfile=None):
         self.sid = sid
         self.pty = pty
         self.lock = threading.Lock()  # serializes all sends + attach/detach
@@ -284,6 +381,10 @@ class _Session:
         self.pending_chars = 0
         self.alive = True
         self.detached_at = time.time()
+        self.logfile = logfile        # transcript file handle, or None
+        self.logbuf = ""              # carry-over for split escape sequences
+        self.lineacc = ""             # current unfinished transcript line
+        self.pending_line = None      # last line held back for redraw-collapse
 
 
 def _pump_session(sess):
@@ -295,6 +396,7 @@ def _pump_session(sess):
             break  # EOFError / pty gone -> shell ended
         if not data:
             continue
+        _log_write(sess, data)  # transcribe to <folder>/context/logs/
         with sess.lock:
             if sess.ws is not None:
                 try:
@@ -309,8 +411,9 @@ def _pump_session(sess):
             while sess.pending_chars > PENDING_CAP and len(sess.pending) > 1:
                 sess.pending_chars -= len(sess.pending.pop(0))
 
-    # The shell exited — tell whoever is watching and forget the session.
+    # The shell exited — close the log, notify whoever is watching, forget it.
     sess.alive = False
+    _close_session_log(sess)
     with sess.lock:
         if sess.ws is not None:
             try:
@@ -398,7 +501,9 @@ def terminal_socket(ws):
             except Exception:
                 pass
             return
-        sess = _Session(sid, pty)
+        # Transcribe this session into the folder it opened in.
+        logfile = _open_session_log(cwd or os.getcwd())
+        sess = _Session(sid, pty, logfile)
         with _sessions_lock:
             _sessions[sid] = sess
         threading.Thread(target=_pump_session, args=(sess,), daemon=True).start()

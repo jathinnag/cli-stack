@@ -15,6 +15,11 @@ draws the terminal in an app-mode browser window — so interactive programs
   folder (or `save <path>` for a specific one). Saved folders then appear in the
   chooser for every new terminal, with a ✕ to forget them.
 - **Copy / paste** — select to copy, middle-click or right-click to paste.
+- **Save / log the transcript** — the 💾 button on a pane downloads its text as a
+  `.txt`, and every session is also auto-logged to a readable transcript at
+  `context/logs/session-<timestamp>.log` **inside the folder the terminal opened
+  in**. (Heads-up: these logs capture whatever the shell prints — including any
+  secrets — so mind where they land and consider git-ignoring `context/logs/`.)
 - **Resume after disconnects** — shells run independently of the browser socket,
   so if it drops (system sleep, a backgrounded tab, a network blip) the page
   reconnects automatically and picks up the same shell, replaying any output it
