@@ -35,19 +35,26 @@ launches your `$SHELL` via [ptyprocess]; the `save` command is wired up for
 
 ## Security
 
-⚠️ **This app gives full shell access to anything that can reach
-`http://127.0.0.1:8000` — there is no authentication.**
+This app can run a real shell, so access is locked down to the one browser
+window the app opens for itself. Three layers work together:
 
-It binds to `127.0.0.1` (localhost only), so it isn't exposed to your network by
-default. But be aware that:
+- **Per-launch token** — a fresh random token is minted each run and only ever
+  placed in the window the app opens. Other local programs don't know it, so
+  they can't connect.
+- **`SameSite=Strict`, `HttpOnly` cookie** — the page swaps the launch token for
+  a cookie scoped to `127.0.0.1`. JavaScript on other sites can't read it, and
+  browsers won't send it on cross-site requests.
+- **`Host`-header allowlist** — the server only honors requests addressed to
+  `127.0.0.1:8000` / `localhost:8000`, which blocks DNS-rebinding attacks (where
+  a malicious site is rebound to `127.0.0.1` but still sends its own domain).
 
-- Any other program running on your machine can connect and run commands as you.
-- A malicious website you visit could, in principle, reach the local server
-  (e.g. via DNS-rebinding) and obtain a shell.
+Every HTTP route and the WebSocket are gated by this; the in-terminal `save`
+command authenticates with the same token via a header.
 
-Run it only on a machine you trust, and don't change the host to `0.0.0.0` or
-forward the port unless you add authentication first. This is a personal-use /
-learning project, **not** a hardened, multi-user remote terminal.
+It also binds to `127.0.0.1` (localhost only), so it isn't exposed to your
+network. Still, treat this as a **personal-use / learning project, not a
+hardened multi-user remote terminal** — don't change the host to `0.0.0.0` or
+forward the port, since that would expose the shell beyond your machine.
 
 ## Project layout
 

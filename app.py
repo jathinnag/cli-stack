@@ -12,6 +12,7 @@ How it works:
 import base64
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -19,7 +20,7 @@ import threading
 import time
 import traceback
 
-from flask import Flask, request, send_from_directory
+from flask import Flask, redirect, request, send_from_directory
 from flask_sock import Sock
 
 # Pick the right pty engine + shell for the operating system.
@@ -33,6 +34,32 @@ else:
 HOST = "127.0.0.1"
 PORT = 8000
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+
+# ---- Authentication ----
+# This server can run a real shell, so we lock it to the one browser window the
+# app opens for itself. A fresh random token is minted each launch; the launch
+# URL carries it once, the page exchanges it for a cookie, and every request
+# afterwards must present that cookie (or, for the in-terminal `save` command,
+# the same token in a header). See _guard() for the full policy.
+TOKEN = secrets.token_urlsafe(32)
+COOKIE = "cli_stack_auth"
+TOKEN_HEADER = "X-CLI-Stack-Token"
+# Only honor requests addressed to our own loopback host:port. This is the key
+# defense against DNS-rebinding, where a malicious site is rebound to 127.0.0.1
+# but the browser still sends its own domain in the Host header.
+ALLOWED_HOSTS = {f"127.0.0.1:{PORT}", f"localhost:{PORT}"}
+
+
+def _token_eq(value):
+    """Constant-time check that `value` equals the session token."""
+    return bool(value) and secrets.compare_digest(value, TOKEN)
+
+
+def _authed():
+    """True if the request carries the token via cookie or header."""
+    return _token_eq(request.cookies.get(COOKIE)) or _token_eq(
+        request.headers.get(TOKEN_HEADER)
+    )
 
 # Folders the user has explicitly kept with the "save" command typed in a
 # terminal. They are never auto-added or auto-evicted — they stay until the
@@ -62,6 +89,7 @@ def _build_spawn():
             " catch { $full = $Path }\r\n"
             "  try {\r\n"
             f"    Invoke-RestMethod -Uri '{SAVE_URL}' -Method Post"
+            f" -Headers @{{ '{TOKEN_HEADER}' = '{TOKEN}' }}"
             " -Body (@{ path = $full } | ConvertTo-Json) -ContentType 'application/json'"
             " -TimeoutSec 5 | Out-Null\r\n"
             '    Write-Host "Saved to cli-stack: $full" -ForegroundColor Green\r\n'
@@ -83,11 +111,11 @@ save() {
   local p="${1:-$PWD}"
   p="$(cd "$p" 2>/dev/null && pwd || echo "$p")"
   if command -v curl >/dev/null 2>&1; then
-    curl -s -X POST -H 'Content-Type: application/json' -d "{\\"path\\":\\"$p\\"}" '__URL__' >/dev/null
+    curl -s -X POST -H 'Content-Type: application/json' -H '__HDR__: __TOK__' -d "{\\"path\\":\\"$p\\"}" '__URL__' >/dev/null
   fi
   echo "Saved to cli-stack: $p"
 }
-'''.replace("__URL__", SAVE_URL)
+'''.replace("__URL__", SAVE_URL).replace("__HDR__", TOKEN_HEADER).replace("__TOK__", TOKEN)
         try:
             with open(rc, "w", encoding="utf-8") as f:
                 f.write(body)
@@ -103,10 +131,38 @@ app = Flask(__name__, static_folder=None)
 sock = Sock(app)
 
 
+# ---- Gate every request behind the token (HTTP routes and the WebSocket) ----
+
+@app.before_request
+def _guard():
+    # 1) DNS-rebinding defense: ignore anything not addressed to localhost.
+    if request.host not in ALLOWED_HOSTS:
+        return ("Forbidden: unexpected Host header.", 403)
+    # 2) The launch URL carries the token once; index() swaps it for a cookie.
+    if request.path == "/" and _token_eq(request.args.get("token")):
+        return None
+    # 3) Everything else needs the auth cookie (or the save command's header).
+    if not _authed():
+        return (
+            "Unauthorized. Start cli-stack with 'python app.py' so it opens "
+            "its own authenticated window.",
+            401,
+        )
+    return None
+
+
 # ---- Serve the web page and its files ----
 
 @app.route("/")
 def index():
+    # Arriving with a valid token in the URL: set the auth cookie, then redirect
+    # to a clean "/" so the token doesn't linger in history or the referrer.
+    if _token_eq(request.args.get("token")):
+        resp = redirect("/")
+        resp.set_cookie(
+            COOKIE, TOKEN, httponly=True, samesite="Strict", path="/"
+        )
+        return resp
     return send_from_directory(WEB_DIR, "index.html")
 
 
@@ -209,6 +265,11 @@ def unsave_dir():
 
 @sock.route("/ws")
 def terminal_socket(ws):
+    # Re-check auth here too: never spawn a shell for an unauthenticated socket,
+    # even if the before_request guard were somehow bypassed for the upgrade.
+    if request.host not in ALLOWED_HOSTS or not _authed():
+        return
+
     # The page sends a "start" message first, telling us which folder to
     # launch the shell in (chosen via the buttons on a fresh terminal).
     cwd = None
@@ -287,7 +348,8 @@ def terminal_socket(ws):
 
 def open_window():
     time.sleep(1.0)  # give the server a moment to start
-    url = f"http://{HOST}:{PORT}/"
+    # The token rides in the URL exactly once; the page swaps it for a cookie.
+    url = f"http://{HOST}:{PORT}/?token={TOKEN}"
     try:
         # Microsoft Edge in "app mode": a clean window with no tabs/bar.
         subprocess.Popen(
