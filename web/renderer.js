@@ -102,9 +102,21 @@ class Pane {
     this.term.onData((data) => this.send({ type: "input", data }));
 
     this.el.addEventListener("focusin", () => setActive(this));
-    this.el.addEventListener("mousedown", () => this.term.focus());
+    this.el.addEventListener("mousedown", (e) => {
+      // Middle-click pastes (classic terminal convention), then bail so the
+      // browser's own middle-click auto-scroll doesn't kick in.
+      if (e.button === 1) {
+        e.preventDefault();
+        this.paste();
+        return;
+      }
+      this.term.focus();
+    });
 
-    // Right-click -> split / close menu.
+    // Selecting text with the mouse copies it to the clipboard automatically.
+    this.el.addEventListener("mouseup", () => this.copySelection());
+
+    // Right-click -> copy / paste + split / close menu.
     this.el.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       showContextMenu(e.clientX, e.clientY, this);
@@ -224,6 +236,28 @@ class Pane {
   send(message) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message));
+    }
+  }
+
+  // Copy whatever is currently selected in this terminal to the clipboard.
+  copySelection() {
+    const text = this.term.getSelection();
+    if (text) {
+      try { navigator.clipboard.writeText(text); } catch (e) { /* denied */ }
+    }
+  }
+
+  // Paste the clipboard's text into the shell, as if it were typed.
+  async paste() {
+    let text = "";
+    try {
+      text = await navigator.clipboard.readText();
+    } catch (e) {
+      return; // clipboard read blocked (permissions / not focused)
+    }
+    if (text) {
+      this.send({ type: "input", data: text });
+      this.term.focus();
     }
   }
 
@@ -411,6 +445,12 @@ function showContextMenu(x, y, pane) {
   menu.className = "context-menu";
 
   const items = [];
+  // Clipboard first: Copy (only when something is selected) and Paste.
+  if (pane.term.hasSelection()) {
+    items.push({ label: "Copy", fn: () => pane.copySelection() });
+  }
+  items.push({ label: "Paste", fn: () => pane.paste() });
+  items.push({ separator: true });
   // Splitting adds a terminal, so only offer it while under the per-tab cap.
   if (countLeaves(root) < MAX_PANES) {
     items.push({ label: "Split left / right", fn: () => splitPane(pane, "row") });
@@ -423,6 +463,12 @@ function showContextMenu(x, y, pane) {
     items.push({ label: "Close terminal", fn: () => closePane(pane) });
   }
   items.forEach((it) => {
+    if (it.separator) {
+      const sep = document.createElement("div");
+      sep.className = "context-separator";
+      menu.appendChild(sep);
+      return;
+    }
     const row = document.createElement("div");
     row.className = "context-item" + (it.disabled ? " disabled" : "");
     row.textContent = it.label;
