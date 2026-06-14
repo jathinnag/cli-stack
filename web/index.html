@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>cli-stack</title>
+
+    <!-- App icon = an emoji drawn into an SVG, used directly as the favicon.
+         This is what shows in the window title bar and the taskbar.
+         To use a different icon, just change the emoji below (the 🖥️). -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖥️</text></svg>"
+    />
+
+    <link rel="stylesheet" href="vendor/xterm.css" />
+
+    <style>
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: #000;
+        font-family: "Segoe UI", system-ui, sans-serif;
+        overflow: hidden;
+      }
+
+      /* ---- Browser-style tab strip ---- */
+      #tabbar {
+        height: 36px;
+        box-sizing: border-box;
+        background: #141414;
+        display: flex;
+        align-items: stretch;
+        padding: 5px 6px 0 6px;
+        gap: 4px;
+        border-bottom: 1px solid #2a2a2a;
+        overflow-x: auto;
+        overflow-y: hidden;
+      }
+      #tabbar::-webkit-scrollbar { height: 0; }
+
+      .tab {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 6px 0 12px;
+        background: #1f1f1f;
+        border: 1px solid #2a2a2a;
+        border-bottom: none;
+        border-radius: 8px 8px 0 0;
+        color: #9a9a9a;
+        font-size: 12px;
+        cursor: pointer;
+        max-width: 200px;
+        white-space: nowrap;
+        user-select: none;
+      }
+      .tab:hover { background: #262626; }
+      .tab.active { background: #000; color: #fff; border-color: #3a3a3a; }
+      .tab-title { overflow: hidden; text-overflow: ellipsis; }
+      .tab-count {
+        font-size: 10px;
+        color: #777;
+        background: #2a2a2a;
+        border-radius: 8px;
+        padding: 0 5px;
+      }
+      .tab.active .tab-count { color: #9bb6ff; background: #1a2540; }
+      .tab-close {
+        color: #888;
+        border-radius: 4px;
+        width: 16px;
+        height: 16px;
+        line-height: 16px;
+        text-align: center;
+        font-size: 11px;
+      }
+      .tab-close:hover { background: #c0392b; color: #fff; }
+      .tab-add {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 28px;
+        color: #ccc;
+        cursor: pointer;
+        font-size: 18px;
+        border-radius: 6px;
+        margin-bottom: 1px;
+      }
+      .tab-add:hover { background: #2a2a2a; }
+
+      /* ---- Top toolbar ---- */
+      #toolbar {
+        height: 36px;
+        box-sizing: border-box;
+        background: #1b1b1b;
+        display: flex;
+        align-items: center;
+        padding: 0 8px;
+        position: relative;
+        border-bottom: 1px solid #2a2a2a;
+      }
+      #layout-btn {
+        background: #2d2d2d;
+        color: #ddd;
+        border: 1px solid #3d3d3d;
+        border-radius: 6px;
+        padding: 4px 12px;
+        cursor: pointer;
+        font-size: 13px;
+      }
+      #layout-btn:hover { background: #3a3a3a; }
+
+      /* ---- Snap-Layouts-style picker flyout ---- */
+      #picker {
+        position: absolute;
+        top: 42px;
+        left: 8px;
+        background: #1b1b1b;
+        border: 1px solid #3d3d3d;
+        border-radius: 10px;
+        padding: 12px;
+        display: grid;
+        grid-template-columns: repeat(3, auto);
+        gap: 12px;
+        z-index: 10;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+      }
+      #picker.hidden { display: none; }
+
+      .layout-option {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 6px;
+        padding: 8px;
+        border-radius: 8px;
+        cursor: pointer;
+      }
+      .layout-option:hover { background: #2a2a2a; }
+
+      .mini-grid {
+        width: 64px;
+        height: 46px;
+        display: flex;
+        gap: 3px;
+      }
+      .mini-cell { background: #3a78ff; border-radius: 3px; flex: 1; }
+      .layout-label { color: #bbb; font-size: 11px; }
+
+      /* ---- The split-tree of terminal panes ---- */
+      #grid {
+        height: calc(100% - 72px);
+        display: flex;
+        box-sizing: border-box;
+      }
+
+      /* A split container holds children laid out in a row or column. */
+      .split {
+        display: flex;
+        flex: 1 1 0;
+        min-width: 0;
+        min-height: 0;
+      }
+      .split.row { flex-direction: row; }
+      .split.col { flex-direction: column; }
+
+      /* A wrapper around each child of a split (its size is set in JS). */
+      .split-child {
+        display: flex;
+        flex-basis: 0;
+        min-width: 0;
+        min-height: 0;
+        overflow: hidden;
+      }
+
+      /* The draggable divider between two panes.
+         The gutter itself is a roomy (invisible) grab area; the visible LINE is
+         a thin centered ::before that's inset at its ends and glows on hover. */
+      .gutter {
+        background: transparent;
+        flex: 0 0 6px;       /* grab area width — must match GUTTER in renderer.js */
+        position: relative;
+        z-index: 2;
+      }
+      .gutter::before {
+        content: "";
+        position: absolute;
+        background: #1a1a1a;
+        border-radius: 2px;
+        transition: background 0.1s, box-shadow 0.1s;
+      }
+      /* Vertical line (side-by-side panes): thin in width, padded top & bottom. */
+      .gutter.row { cursor: col-resize; }
+      .gutter.row::before {
+        top: 8px; bottom: 8px;
+        left: 50%; width: 2px; transform: translateX(-50%);
+      }
+      /* Horizontal line (stacked panes): thin in height, padded left & right. */
+      .gutter.col { cursor: row-resize; }
+      .gutter.col::before {
+        left: 8px; right: 8px;
+        top: 50%; height: 2px; transform: translateY(-50%);
+      }
+      .gutter:hover::before {
+        background: #ffd23f;
+        box-shadow: 0 0 8px 2px rgba(255, 210, 63, 0.7);
+      }
+
+      /* A single terminal pane. */
+      .pane {
+        flex: 1 1 0;
+        min-width: 0;
+        min-height: 0;
+        position: relative;
+        overflow: hidden;
+        border: 1px solid #2a2a2a;
+        border-radius: 6px;
+        background: #000;
+      }
+      .pane.active { border-color: #3a78ff; }
+      .pane-term { width: 100%; height: 100%; }
+
+      /* ---- "Where should this terminal start?" chooser ---- */
+      .start-overlay {
+        position: absolute;
+        inset: 0;
+        background: #000;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        z-index: 8;
+      }
+      .start-title {
+        color: #888;
+        font-size: 13px;
+        margin-bottom: 6px;
+      }
+      .start-btn {
+        background: #000;
+        color: #fff;
+        border: 1px solid #fff;
+        border-radius: 0;
+        padding: 11px 22px;
+        font-size: 14px;
+        min-width: 260px;
+        cursor: pointer;
+        font-family: inherit;
+        box-shadow: 4px 4px 0 0 #fff;
+      }
+      .start-btn:hover { background: #111; }
+      .start-btn:disabled { opacity: 0.5; cursor: default; }
+      /* The real folder path shown beneath the "This directory" label. */
+      .start-btn-path {
+        display: block;
+        margin-top: 4px;
+        font-size: 11px;
+        color: #aaa;
+        font-family: "Cascadia Mono", Consolas, monospace;
+        max-width: 320px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      /* The list of previously-used folders under the "recent" button. */
+      .recent-list {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 4px;
+        max-height: 220px;
+        overflow-y: auto;
+        width: 300px;
+      }
+      .recent-list.hidden { display: none; }
+      .recent-item {
+        background: #000;
+        color: #ddd;
+        border: 1px solid #444;
+        border-radius: 0;
+        padding: 7px 12px;
+        font-size: 12px;
+        font-family: "Cascadia Mono", Consolas, monospace;
+        cursor: pointer;
+        text-align: left;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .recent-item:hover { border-color: #fff; color: #fff; }
+      .recent-empty {
+        color: #777;
+        font-size: 12px;
+        text-align: center;
+        padding: 6px;
+      }
+
+      /* ✕ close button, shown when hovering a pane */
+      .pane-close {
+        position: absolute;
+        top: 4px;
+        right: 6px;
+        width: 18px;
+        height: 18px;
+        line-height: 18px;
+        text-align: center;
+        color: #999;
+        background: rgba(40, 40, 40, 0.7);
+        border-radius: 4px;
+        font-size: 12px;
+        cursor: pointer;
+        z-index: 5;
+        opacity: 0;
+        transition: opacity 0.1s;
+      }
+      .pane:hover .pane-close { opacity: 1; }
+      .pane-close:hover { background: #c0392b; color: #fff; }
+      /* When there's only one terminal, you can't close it — hide the ✕. */
+      #grid.single .pane-close { display: none; }
+
+      /* Right-click menu */
+      .context-menu {
+        position: fixed;
+        background: #1b1b1b;
+        border: 1px solid #3d3d3d;
+        border-radius: 8px;
+        padding: 4px;
+        z-index: 50;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+        min-width: 160px;
+      }
+      .context-item {
+        padding: 6px 12px;
+        color: #ddd;
+        font-size: 13px;
+        border-radius: 5px;
+        cursor: pointer;
+      }
+      .context-item:hover { background: #3a78ff; color: #fff; }
+      .context-item.disabled {
+        color: #666;
+        cursor: default;
+      }
+      .context-item.disabled:hover { background: transparent; color: #666; }
+    </style>
+  </head>
+
+  <body>
+    <!-- Browser-style tabs; each tab is an independent set of terminals -->
+    <div id="tabbar"></div>
+
+    <div id="toolbar">
+      <button id="layout-btn">&#x229e; Layouts</button>
+      <div id="picker" class="hidden"></div>
+    </div>
+
+    <!-- The split-tree of terminal panes is built inside here -->
+    <div id="grid"></div>
+
+    <script src="vendor/xterm.js"></script>
+    <script src="vendor/addon-fit.js"></script>
+    <script src="renderer.js"></script>
+  </body>
+</html>
