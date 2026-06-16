@@ -719,7 +719,7 @@ function loadTab() {
 
 function newTab() {
   saveTab();
-  const t = { root: leaf(new Pane()), activePane: null };
+  const t = { root: leaf(new Pane()), activePane: null, name: null };
   t.activePane = t.root.pane;
   tabs.push(t);
   current = tabs.length - 1;
@@ -758,11 +758,12 @@ function renderTabs() {
   tabs.forEach((t, i) => {
     const el = document.createElement("div");
     el.className = "tab" + (i === current ? " active" : "");
-    el.addEventListener("click", () => switchTab(i));
+    el.addEventListener("click", () => onTabClick(i));
 
     const title = document.createElement("span");
     title.className = "tab-title";
-    title.textContent = `Terminal ${i + 1}`;
+    title.textContent = t.name || `Terminal ${i + 1}`;
+    title.title = "Double-click to rename";
     el.appendChild(title);
 
     // How many terminals this tab holds (X / 4).
@@ -788,6 +789,64 @@ function renderTabs() {
   add.title = "New tab";
   add.addEventListener("click", newTab);
   tabbar.appendChild(add);
+}
+
+// A single click switches tabs; two quick clicks on the same tab rename it.
+// We detect the double-click ourselves (rather than via the native `dblclick`
+// event) because switchTab() rebuilds the whole tab strip, so the two clicks
+// land on different DOM nodes and a native dblclick would be unreliable. The
+// timestamp/index state below lives at module scope, so it survives re-renders.
+let lastTabClick = { i: -1, t: 0 };
+function onTabClick(i) {
+  const now = Date.now();
+  if (lastTabClick.i === i && now - lastTabClick.t < 400) {
+    lastTabClick = { i: -1, t: 0 };
+    switchTab(i);   // make sure the tab we're renaming is the active one
+    beginRename(i); // re-renders, so query the live node by index inside
+    return;
+  }
+  lastTabClick = { i, t: now };
+  switchTab(i);
+}
+
+// Swap a tab's title for an inline text field so the user can rename it.
+// Enter / blur commits, Escape cancels, and an empty value restores the
+// default "Terminal N" label.
+function beginRename(i) {
+  const el = tabbar.children[i];
+  if (!el) return;
+  const title = el.querySelector(".tab-title");
+  if (!title) return;
+
+  const input = document.createElement("input");
+  input.className = "tab-rename";
+  input.value = tabs[i].name || `Terminal ${i + 1}`;
+
+  let done = false;
+  const commit = (save) => {
+    if (done) return; // blur fires after Enter/Escape — only act once.
+    done = true;
+    if (save) {
+      const name = input.value.trim();
+      tabs[i].name = name || null; // null => fall back to the default label.
+    }
+    renderTabs();
+    if (activePane) activePane.term.focus();
+  };
+
+  // Keep typing/clicks inside the field from switching tabs or reaching the
+  // focused terminal.
+  input.addEventListener("click", (e) => e.stopPropagation());
+  input.addEventListener("keydown", (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") commit(true);
+    else if (e.key === "Escape") commit(false);
+  });
+  input.addEventListener("blur", () => commit(true));
+
+  el.replaceChild(input, title);
+  input.focus();
+  input.select();
 }
 
 // Keep the per-tab terminal count badge fresh after splits/closes/layouts.
