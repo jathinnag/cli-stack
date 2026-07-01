@@ -12,3 +12,4 @@ Thumbs.db
 
 # App state written to the home folder if it ever lands here by accident
 .cli-stack-*.json
+context

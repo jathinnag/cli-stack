@@ -741,6 +741,13 @@ function switchTab(i) {
 
 function closeTab(i) {
   if (tabs.length <= 1) return; // always keep at least one tab
+
+  // Confirm before closing — closing a tab disposes all of its terminals.
+  const name = tabs[i].name || `Terminal ${i + 1}`;
+  const n = countLeaves(tabs[i].root);
+  const detail = n > 1 ? ` and its ${n} terminals` : "";
+  if (!confirm(`Close "${name}"${detail}?`)) return;
+
   saveTab();
   collectPanes(tabs[i].root).forEach((p) => p.dispose());
   tabs.splice(i, 1);
@@ -856,6 +863,16 @@ render = function () {
   _render();
   renderTabs();
 };
+
+// ---------------------------------------------------------------------------
+// Confirm before the whole window closes (the "X" button, Alt+F4, etc.).
+// Browsers no longer allow a custom message here — they show their own
+// generic "leave site?" prompt — but setting returnValue is what triggers it.
+// ---------------------------------------------------------------------------
+window.addEventListener("beforeunload", (e) => {
+  e.preventDefault();
+  e.returnValue = "";
+});
 
 // ---------------------------------------------------------------------------
 // Start up: one tab with one terminal.
