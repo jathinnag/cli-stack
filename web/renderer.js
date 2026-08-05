@@ -102,6 +102,13 @@ class Pane {
       fontFamily: "'Cascadia Mono', Consolas, 'Courier New', monospace",
       theme: { background: "#000000", foreground: "#ffffff", cursor: "#ffffff" },
     });
+    // App chords (Ctrl+1..9 tab switch, Ctrl+Shift+L layout cycle): make
+    // xterm ignore them so the keydown bubbles up to the window handlers
+    // instead of being sent to the shell.
+    this.term.attachCustomKeyEventHandler(
+      (e) => tabSwitchIndex(e) < 0 && !isLayoutCycleKey(e)
+    );
+
     this.fit = new FitAddon.FitAddon();
     this.term.loadAddon(this.fit);
     this.term.open(termEl);
@@ -336,7 +343,10 @@ class Pane {
       return; // clipboard read blocked (permissions / not focused)
     }
     if (text) {
-      this.send({ type: "input", data: text });
+      // Route through xterm's own paste handling (same as Ctrl+V) so line
+      // endings are normalized (\r\n -> \r) and bracketed paste is honored,
+      // instead of sending raw clipboard text to the shell.
+      this.term.paste(text);
       this.term.focus();
     }
   }
@@ -627,6 +637,41 @@ function applyLayout(layout) {
   if (!collectPanes(root).includes(activePane)) setActive(collectPanes(root)[0]);
 }
 
+// Ctrl+Shift+L cycles the tab through the presets that hold EXACTLY the
+// terminals it already has, so cycling only rearranges panes — it never
+// spawns or closes a shell (2 panes: side by side <-> stacked, 3 panes:
+// three columns <-> main + two). Uses e.code so it works on any layout.
+function isLayoutCycleKey(e) {
+  return e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === "KeyL";
+}
+
+// Do two trees split the screen the same way? (Panes and drag-adjusted
+// sizes are ignored — only the structure matters.)
+function sameShape(a, b) {
+  if (a.type !== b.type) return false;
+  if (a.type === "leaf") return true;
+  return a.dir === b.dir && a.children.length === b.children.length &&
+    a.children.every((c, i) => sameShape(c, b.children[i]));
+}
+
+function cycleLayout() {
+  const n = collectPanes(root).length;
+  const options = LAYOUTS.filter((l) => countLeaves(l.tree) === n);
+  if (options.length < 2) return; // nothing to cycle to at this pane count
+
+  // Start after the preset we're currently on; a hand-made layout that
+  // matches no preset (findIndex -1) starts the cycle at the first option.
+  const at = options.findIndex((l) => sameShape(l.tree, root));
+  applyLayout(options[(at + 1) % options.length]);
+  if (activePane) activePane.term.focus();
+}
+
+window.addEventListener("keydown", (e) => {
+  if (!isLayoutCycleKey(e)) return;
+  e.preventDefault();
+  cycleLayout();
+});
+
 // ---------------------------------------------------------------------------
 // Build the Snap-Layouts-style picker thumbnails from each tree.
 // ---------------------------------------------------------------------------
@@ -728,6 +773,26 @@ function newTab() {
   render();
   if (activePane) activePane.term.focus();
 }
+
+// Ctrl+1..8 jumps straight to that tab; Ctrl+9 jumps to the LAST tab
+// (browser convention). Returns the target tab index, or -1 if the event
+// isn't a tab-switch chord. Uses e.code so it works on any keyboard layout.
+function tabSwitchIndex(e) {
+  if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return -1;
+  const m = /^Digit([1-9])$/.exec(e.code);
+  if (!m) return -1;
+  const n = Number(m[1]);
+  return n === 9 ? tabs.length - 1 : n - 1;
+}
+
+// Bubble phase on purpose: the tab-rename input stops propagation of its own
+// keydowns, so typing Ctrl+1 while renaming won't yank the tab strip away.
+window.addEventListener("keydown", (e) => {
+  const i = tabSwitchIndex(e);
+  if (i < 0 || i >= tabs.length) return;
+  e.preventDefault();
+  switchTab(i);
+});
 
 function switchTab(i) {
   if (i === current) return;

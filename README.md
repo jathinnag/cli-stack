@@ -16,10 +16,13 @@ draws the terminal in an app-mode browser window — so interactive programs
   chooser for every new terminal, with a ✕ to forget them.
 - **Copy / paste** — select to copy, middle-click or right-click to paste.
 - **Save / log the transcript** — the 💾 button on a pane downloads its text as a
-  `.txt`, and every session is also auto-logged to a readable transcript at
+  `.txt`. Sessions can also be auto-logged to a readable transcript at
   `context/logs/session-<timestamp>.log` **inside the folder the terminal opened
-  in**. (Heads-up: these logs capture whatever the shell prints — including any
-  secrets — so mind where they land and consider git-ignoring `context/logs/`.)
+  in**. Logging is **off by default** — type `log on` in any terminal to enable
+  it (it applies to already-open terminals too and is remembered across
+  restarts), `log off` to stop, and `log` to see the current state. (Heads-up:
+  these logs capture whatever the shell prints — including any secrets — so mind
+  where they land and consider git-ignoring `context/logs/`.)
 - **Resume after disconnects** — shells run independently of the browser socket,
   so if it drops (system sleep, a backgrounded tab, a network blip) the page
   reconnects automatically and picks up the same shell, replaying any output it

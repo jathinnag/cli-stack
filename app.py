@@ -10,6 +10,7 @@ How it works:
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -72,13 +73,73 @@ _saved_lock = threading.Lock()
 # The URL the in-terminal `save` command posts the current folder to.
 SAVE_URL = f"http://{HOST}:{PORT}/save-dir"
 
+# App settings that survive restarts (currently just the logging switch).
+# Session logging is OFF by default; the in-terminal `log on` command enables it.
+# The filename carries a short hash of this installation's folder, so two
+# independent cli-stack checkouts don't share (and overwrite) one settings file.
+_INSTALL_ID = hashlib.sha256(
+    os.path.normcase(os.path.dirname(os.path.abspath(__file__))).encode("utf-8")
+).hexdigest()[:8]
+SETTINGS_FILE = os.path.join(
+    os.path.expanduser("~"), f".cli-stack-settings-{_INSTALL_ID}.json"
+)
+# Where settings lived before they were per-install; read as a fallback so an
+# existing "log on" survives the upgrade.
+_LEGACY_SETTINGS_FILE = os.path.join(
+    os.path.expanduser("~"), ".cli-stack-settings.json"
+)
+_settings_lock = threading.Lock()
+
+# The URL the in-terminal `log` command posts on/off/status to.
+LOG_URL = f"http://{HOST}:{PORT}/set-logging"
+
+
+def _load_settings():
+    """Read settings from disk; {} on any problem. Called once at startup:
+    this process is the sole writer, so from then on the in-memory copy is
+    authoritative and no request needs to touch the filesystem."""
+    for path in (SETTINGS_FILE, _LEGACY_SETTINGS_FILE):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            continue
+    return {}
+
+
+_settings = _load_settings()
+
+
+def _logging_enabled():
+    return bool(_settings.get("logging", False))
+
+
+def _set_logging_enabled(enabled):
+    """Persist the logging switch. The in-memory settings are only updated if
+    the file write succeeds, so a failure (permissions, disk full) is reported
+    instead of silently pretending the setting stuck. Returns True on success."""
+    global _settings
+    with _settings_lock:
+        updated = dict(_settings)
+        updated["logging"] = bool(enabled)
+        try:
+            with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+                json.dump(updated, f)
+        except Exception:
+            return False
+        _settings = updated
+        return True
+
 
 def _build_spawn():
     """The command used to launch each shell.
 
     We define a `save` command/function inside the shell so the user can type
-    `save` (or `save <path>`) in any terminal to remember its current folder.
-    The function just POSTs the current directory back to this server."""
+    `save` (or `save <path>`) in any terminal to remember its current folder,
+    and a `log` command (`log on` / `log off` / `log`) to toggle session
+    logging. Both just POST back to this server."""
     if sys.platform == "win32":
         # Define the function silently at startup, then stay interactive
         # (-NoExit). -EncodedCommand sidesteps all the quoting headaches.
@@ -96,6 +157,23 @@ def _build_spawn():
             '    Write-Host "Saved to cli-stack: $full" -ForegroundColor Green\r\n'
             "  } catch {\r\n"
             '    Write-Host "cli-stack save failed: $($_.Exception.Message)" -ForegroundColor Red\r\n'
+            "  }\r\n"
+            "}\r\n"
+            "function log {\r\n"
+            "  param([string]$Mode = 'status')\r\n"
+            "  if ($Mode -notin @('on','off','status')) {\r\n"
+            '    Write-Host "usage: log [on|off|status]" -ForegroundColor Yellow\r\n'
+            "    return\r\n"
+            "  }\r\n"
+            "  try {\r\n"
+            f"    $resp = Invoke-RestMethod -Uri '{LOG_URL}' -Method Post"
+            f" -Headers @{{ '{TOKEN_HEADER}' = '{TOKEN}' }}"
+            " -Body (@{ mode = $Mode } | ConvertTo-Json) -ContentType 'application/json'"
+            " -TimeoutSec 5\r\n"
+            "    $state = if ($resp.enabled) { 'on' } else { 'off' }\r\n"
+            '    Write-Host "Session logging: $state" -ForegroundColor Green\r\n'
+            "  } catch {\r\n"
+            '    Write-Host "cli-stack log failed: $($_.Exception.Message)" -ForegroundColor Red\r\n'
             "  }\r\n"
             "}\r\n"
         )
@@ -116,7 +194,27 @@ save() {
   fi
   echo "Saved to cli-stack: $p"
 }
-'''.replace("__URL__", SAVE_URL).replace("__HDR__", TOKEN_HEADER).replace("__TOK__", TOKEN)
+log() {
+  local mode="${1:-status}"
+  case "$mode" in
+    on|off|status) ;;
+    *) echo "usage: log [on|off|status]"; return 1 ;;
+  esac
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "cli-stack log failed: curl not found"; return 1
+  fi
+  local resp
+  resp="$(curl -s -X POST -H 'Content-Type: application/json' -H '__HDR__: __TOK__' -d "{\\"mode\\":\\"$mode\\"}" '__LOGURL__')"
+  # Whitespace-tolerant match, so a change in JSON formatting can't break it.
+  if printf '%s' "$resp" | grep -Eq '"enabled"[[:space:]]*:[[:space:]]*true'; then
+    echo "Session logging: on"
+  elif printf '%s' "$resp" | grep -Eq '"enabled"[[:space:]]*:[[:space:]]*false'; then
+    echo "Session logging: off"
+  else
+    echo "cli-stack log failed: ${resp:-no response}"; return 1
+  fi
+}
+'''.replace("__URL__", SAVE_URL).replace("__LOGURL__", LOG_URL).replace("__HDR__", TOKEN_HEADER).replace("__TOK__", TOKEN)
         try:
             with open(rc, "w", encoding="utf-8") as f:
                 f.write(body)
@@ -263,8 +361,9 @@ def unsave_dir():
 
 
 # ---- Session logging ----
-# Every session is transcribed to a plain-text log inside the folder it opened
-# in: <folder>/context/logs/session-<timestamp>.log. The shell stream is full of
+# When enabled (it's OFF by default — type `log on` in any terminal), sessions
+# are transcribed to a plain-text log inside the folder they opened in:
+# <folder>/context/logs/session-<timestamp>.log. The shell stream is full of
 # ANSI color/cursor escapes, so we strip those to keep the log readable. It's a
 # best-effort transcript — interactive line redraws (e.g. PowerShell's
 # PSReadLine) can still leave minor artifacts.
@@ -302,13 +401,13 @@ def _open_session_log(base_dir):
         return None  # logging is best-effort; the terminal still works
 
 
-def _emit_line(sess, line):
+def _emit_line(sess, f, line):
     """Write one finished transcript line, collapsing keystroke redraws: if the
     previous line is just a shorter prefix of this one (how PSReadLine repaints
     a line as you type), it was a partial redraw, so drop it and keep this one."""
     prev = sess.pending_line
     if prev is not None and not (line.startswith(prev) and line != prev):
-        sess.logfile.write(prev + "\n")
+        f.write(prev + "\n")
     sess.pending_line = line
 
 
@@ -331,7 +430,7 @@ def _log_write(sess, data):
         lines = sess.lineacc.split("\n")
         sess.lineacc = lines.pop()  # last piece has no newline yet — keep it
         for line in lines:
-            _emit_line(sess, line)
+            _emit_line(sess, f, line)
         f.flush()
     except Exception:
         pass
@@ -348,7 +447,7 @@ def _close_session_log(sess):
         tail = _strip_ansi(sess.logbuf) + sess.lineacc
         sess.logbuf = sess.lineacc = ""
         for line in tail.split("\n"):
-            _emit_line(sess, line)
+            _emit_line(sess, f, line)
         if sess.pending_line is not None:
             f.write(sess.pending_line + "\n")
             sess.pending_line = None
@@ -372,9 +471,10 @@ _sessions_lock = threading.Lock()
 
 
 class _Session:
-    def __init__(self, sid, pty, logfile=None):
+    def __init__(self, sid, pty, logfile=None, cwd=None):
         self.sid = sid
         self.pty = pty
+        self.cwd = cwd or os.getcwd()  # where logs go if logging turns on later
         self.lock = threading.Lock()  # serializes all sends + attach/detach
         self.ws = None                # the currently attached socket, or None
         self.pending = []             # output collected while detached
@@ -458,6 +558,34 @@ def _reap_sessions():
                 _kill_session(sid)
 
 
+# How pasted input is fed to the shell. A multi-line paste arrives as one big
+# blob; written all at once it can overflow the console's small type-ahead
+# buffer while the shell is busy executing the first pasted line, silently
+# dropping the rest. So anything bigger than one chunk is drip-fed with short
+# pauses. Single keystrokes are one chunk and go through with no delay.
+PTY_WRITE_CHUNK = 128   # characters per write
+PTY_WRITE_PAUSE = 0.008  # seconds between chunks of a large (pasted) input
+
+
+def _pty_write_all(pty, data):
+    """Write ALL of `data` to the pty: pty.write() reports how much it actually
+    wrote, so retry the remainder instead of silently truncating on a partial
+    write (which happens exactly when the shell is busy, i.e. mid-paste)."""
+    i = 0
+    while i < len(data):
+        chunk = data[i : i + PTY_WRITE_CHUNK]
+        written = pty.write(chunk)
+        if written is None or written >= len(chunk):
+            i += len(chunk)
+        elif written > 0:
+            i += written
+        else:
+            time.sleep(PTY_WRITE_PAUSE)  # pipe full — let the shell drain
+            continue
+        if i < len(data):
+            time.sleep(PTY_WRITE_PAUSE)
+
+
 # ---- The live connection between the page and a real shell ----
 
 @sock.route("/ws")
@@ -501,9 +629,10 @@ def terminal_socket(ws):
             except Exception:
                 pass
             return
-        # Transcribe this session into the folder it opened in.
-        logfile = _open_session_log(cwd or os.getcwd())
-        sess = _Session(sid, pty, logfile)
+        # Transcribe this session into the folder it opened in — but only if
+        # the user has switched logging on (`log on`); it's off by default.
+        logfile = _open_session_log(cwd or os.getcwd()) if _logging_enabled() else None
+        sess = _Session(sid, pty, logfile, cwd=cwd)
         with _sessions_lock:
             _sessions[sid] = sess
         threading.Thread(target=_pump_session, args=(sess,), daemon=True).start()
@@ -533,7 +662,7 @@ def terminal_socket(ws):
                 continue  # ignore anything that isn't a JSON command
             kind = msg.get("type")
             if kind == "input":
-                sess.pty.write(msg.get("data", ""))
+                _pty_write_all(sess.pty, msg.get("data", ""))
             elif kind == "resize":
                 try:
                     sess.pty.setwinsize(int(msg["rows"]), int(msg["cols"]))
@@ -549,6 +678,36 @@ def terminal_socket(ws):
             if sess.ws is ws:
                 sess.ws = None
                 sess.detached_at = time.time()
+
+
+@app.route("/set-logging", methods=["POST"])
+def set_logging():
+    # Called by the `log` command running inside a terminal. Toggling applies
+    # immediately to every live shell, not just future ones: `log on` starts a
+    # fresh transcript for each session that isn't logging yet, and `log off`
+    # closes any open transcripts.
+    data = request.get_json(silent=True) or {}
+    mode = data.get("mode")
+    if mode not in ("on", "off", "status"):
+        return {"ok": False, "error": "mode must be on, off or status"}, 400
+    if mode != "status":
+        enable = mode == "on"
+        if not _set_logging_enabled(enable):
+            # Don't toggle the live sessions either: the user asked for a
+            # persistent change and it didn't take, so say so loudly.
+            return {
+                "ok": False,
+                "error": f"could not write settings file: {SETTINGS_FILE}",
+            }, 500
+        with _sessions_lock:
+            live = list(_sessions.values())
+        for sess in live:
+            if enable:
+                if sess.alive and sess.logfile is None:
+                    sess.logfile = _open_session_log(sess.cwd)
+            else:
+                _close_session_log(sess)
+    return {"ok": True, "enabled": _logging_enabled()}
 
 
 @app.route("/close-session", methods=["POST"])
