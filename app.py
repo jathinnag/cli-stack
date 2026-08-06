@@ -568,20 +568,22 @@ PTY_WRITE_PAUSE = 0.008  # seconds between chunks of a large (pasted) input
 
 
 def _pty_write_all(pty, data):
-    """Write ALL of `data` to the pty: pty.write() reports how much it actually
-    wrote, so retry the remainder instead of silently truncating on a partial
-    write (which happens exactly when the shell is busy, i.e. mid-paste)."""
+    """Write ALL of `data` to the pty in paced chunks.
+
+    pty.write()'s return value is only honored for a genuine partial write
+    (0 < written < chunk, which the POSIX backend can report). pywinpty 3.x
+    returns 0 even for a successful write, so 0 must NOT be treated as
+    "nothing written, retry" — that re-sends the same chunk forever, spamming
+    the shell with endless duplicates (its own writes block until complete,
+    so nothing is lost by treating its 0 as success)."""
     i = 0
     while i < len(data):
         chunk = data[i : i + PTY_WRITE_CHUNK]
         written = pty.write(chunk)
-        if written is None or written >= len(chunk):
-            i += len(chunk)
-        elif written > 0:
-            i += written
+        if isinstance(written, int) and 0 < written < len(chunk):
+            i += written  # partial write — resume from where it stopped
         else:
-            time.sleep(PTY_WRITE_PAUSE)  # pipe full — let the shell drain
-            continue
+            i += len(chunk)
         if i < len(data):
             time.sleep(PTY_WRITE_PAUSE)
 
