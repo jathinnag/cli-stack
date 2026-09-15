@@ -33,9 +33,12 @@ const GUTTER = 6; // gutter grab-area width in pixels (must match .gutter flex-b
 const MAX_PANES = 4; // most terminals allowed in a single tab
 
 const grid = document.getElementById("grid");
-const tabbar = document.getElementById("tabbar");
+// The inner strip that holds only the tab elements; the ⋮ overflow button
+// sits beside it in #tabbar and survives renderTabs() rebuilds.
+const tabbar = document.getElementById("tabs");
 const picker = document.getElementById("picker");
-const layoutBtn = document.getElementById("layout-btn");
+const menuBtn = document.getElementById("menu-btn");
+const appMenu = document.getElementById("app-menu");
 
 // `tabs` holds every open tab; the ACTIVE tab's layout is mirrored into the
 // `root` / `activePane` globals below so the rest of the code is unchanged.
@@ -45,6 +48,7 @@ let current = -1;        // index of the active tab in `tabs`
 
 let root = null;         // the active tab's live layout tree
 let activePane = null;   // the active tab's highlighted pane
+let zoomedPane = null;   // the active tab's pinned "focus zoom" pane (or null)
 
 // The app's launch folder ("This directory"), fetched once and reused.
 let _defaultDir = null;
@@ -59,6 +63,45 @@ function defaultDir() {
 }
 
 // ---------------------------------------------------------------------------
+// UI icons: inline SVG line icons, stroke-only and monochrome, so they look
+// identical on every platform (emoji glyphs like 💾 render in full colour and
+// vary by font; text ✕ / + glyphs sit differently in every font). They stroke
+// with `currentColor`, so the button's CSS `color` — including its hover
+// state — drives the icon.
+const ICONS = {
+  close: '<path d="M4 4l8 8M12 4l-8 8"/>',
+  plus: '<path d="M8 3v10M3 8h10"/>',
+  save:
+    '<path d="M2.5 2.5h8l3 3v8h-11z"/>' +
+    '<path d="M5.5 2.5v3.5h5V2.5"/>' +
+    '<path d="M4.5 13.5v-4h7v4"/>',
+  focus:
+    '<path d="M6 2.5H2.5V6M10 2.5h3.5V6M6 13.5H2.5V10M10 13.5h3.5V10"/>',
+};
+
+function svgIcon(name) {
+  return (
+    '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" ' +
+    'stroke="currentColor" stroke-width="1.4" stroke-linecap="round" ' +
+    'stroke-linejoin="round" aria-hidden="true">' +
+    ICONS[name] +
+    "</svg>"
+  );
+}
+
+// An icon-only <button>: `label` doubles as tooltip and accessible name.
+function iconButton(className, iconName, label, onClick) {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "ui-btn " + className;
+  b.innerHTML = svgIcon(iconName);
+  b.title = label;
+  b.setAttribute("aria-label", label);
+  b.addEventListener("click", (e) => { e.stopPropagation(); onClick(); });
+  return b;
+}
+
+// ---------------------------------------------------------------------------
 // A Pane = one terminal + its own connection to a real shell on the server.
 // ---------------------------------------------------------------------------
 class Pane {
@@ -70,29 +113,21 @@ class Pane {
     termEl.className = "pane-term";
     this.el.appendChild(termEl);
 
-    // ✕ close button (shown on hover via CSS).
-    const closeBtn = document.createElement("div");
-    closeBtn.className = "pane-close";
-    closeBtn.textContent = "✕";
-    closeBtn.title = "Close terminal";
-    closeBtn.addEventListener("mousedown", (e) => e.stopPropagation());
-    closeBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      closePane(this);
-    });
-    this.el.appendChild(closeBtn);
-
-    // 💾 save button (left of ✕): downloads this terminal's text as a .txt file.
-    const saveBtn = document.createElement("div");
-    saveBtn.className = "pane-save";
-    saveBtn.textContent = "💾";
-    saveBtn.title = "Save this terminal's text to a file";
-    saveBtn.addEventListener("mousedown", (e) => e.stopPropagation());
-    saveBtn.addEventListener("click", (e) => {
-      e.stopPropagation();
-      this.saveToFile();
-    });
-    this.el.appendChild(saveBtn);
+    // Tool strip in the top-right corner: focus / save / close. Revealed only
+    // while the pointer is in that corner (see .pane-tools in the CSS).
+    const tools = document.createElement("div");
+    tools.className = "pane-tools";
+    tools.addEventListener("mousedown", (e) => e.stopPropagation());
+    this.focusBtn = iconButton("pane-btn pane-focus", "focus", "Focus this terminal",
+      () => toggleZoomPane(this));
+    tools.append(
+      this.focusBtn,
+      iconButton("pane-btn pane-save", "save", "Save transcript to a file",
+        () => this.saveToFile()),
+      iconButton("pane-btn pane-close", "close", "Close terminal",
+        () => closePane(this))
+    );
+    this.el.appendChild(tools);
 
     this.term = new Terminal({
       cursorBlink: true,
@@ -102,11 +137,11 @@ class Pane {
       fontFamily: "'Cascadia Mono', Consolas, 'Courier New', monospace",
       theme: { background: "#000000", foreground: "#ffffff", cursor: "#ffffff" },
     });
-    // App chords (Ctrl+1..9 tab switch, Ctrl+Shift+L layout cycle): make
-    // xterm ignore them so the keydown bubbles up to the window handlers
-    // instead of being sent to the shell.
+    // App chords (Ctrl+1..9 tab switch, the Ctrl+Shift+letter SHORTCUTS):
+    // make xterm ignore them so the keydown bubbles up to the window
+    // handlers instead of being sent to the shell.
     this.term.attachCustomKeyEventHandler(
-      (e) => tabSwitchIndex(e) < 0 && !isLayoutCycleKey(e)
+      (e) => tabSwitchIndex(e) < 0 && !chordFor(e)
     );
 
     this.fit = new FitAddon.FitAddon();
@@ -212,18 +247,14 @@ class Pane {
         const item = document.createElement("div");
         item.className = "recent-item saved-item";
 
-        const label = document.createElement("span");
-        label.className = "saved-item-path";
+        const label = document.createElement("button");
+        label.type = "button";
+        label.className = "ui-btn saved-item-path";
         label.textContent = dir;
         label.title = dir;
         label.addEventListener("click", () => this.start(dir));
 
-        const remove = document.createElement("span");
-        remove.className = "saved-remove";
-        remove.textContent = "✕";
-        remove.title = "Remove from saved";
-        remove.addEventListener("click", async (e) => {
-          e.stopPropagation();
+        const remove = iconButton("saved-remove", "close", "Remove from saved", async () => {
           try {
             await fetch("/unsave-dir", {
               method: "POST",
@@ -284,6 +315,11 @@ class Pane {
   }
 
   resize() {
+    // During a focus-zoom glide the observer fires every frame with transient
+    // sizes; each pty resize makes the console host rewrap and repaint, which
+    // mangles the buffer. Skip those — syncSizesAnimated() does one clean
+    // refit for every pane once the glide settles.
+    if (grid.classList.contains("zoom-anim")) return;
     try {
       this.fit.fit();
       this.send({ type: "resize", rows: this.term.rows, cols: this.term.cols });
@@ -458,7 +494,7 @@ function renderNode(node, parentEl) {
 
 function render() {
   grid.innerHTML = ""; // detaches pane.el nodes; the Pane objects stay alive
-  // In single mode there's nothing to close, so hide the ✕ (see CSS #grid.single).
+  // In single mode there's nothing to close, so hide the close button (see CSS #grid.single).
   grid.classList.toggle("single", countLeaves(root) === 1);
   renderNode(root, grid);
   requestAnimationFrame(() => collectPanes(root).forEach((p) => p.resize()));
@@ -470,6 +506,7 @@ function render() {
 function makeDraggable(gutter, node, index, wraps, container) {
   gutter.addEventListener("mousedown", (e) => {
     e.preventDefault();
+    grid.classList.remove("zoom-anim"); // a drag must track the mouse 1:1
     const horizontal = node.dir === "row";
     const startPos = horizontal ? e.clientX : e.clientY;
     const startA = node.sizes[index];
@@ -510,6 +547,145 @@ function makeDraggable(gutter, node, index, wraps, container) {
 }
 
 // ---------------------------------------------------------------------------
+// Focus zoom: each pane's focus button pins that pane at ~80% of the grid.
+// applyZoom runs from toggleZoomPane() and after every render() (splits,
+// closes, layout swaps, tab switches), so it must be idempotent.
+// ---------------------------------------------------------------------------
+
+// Like findParent, but returns the whole chain of {split, idx} from the root
+// down to the leaf holding `pane` (empty array = root itself is the leaf).
+function findPath(node, pane, path = []) {
+  if (node.type === "leaf") return node.pane === pane ? path : null;
+  for (let i = 0; i < node.children.length; i++) {
+    const hit = findPath(node.children[i], pane, [...path, { split: node, idx: i }]);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+const ZOOM_SHARE = 0.8;       // area the focused pane aims for
+const ZOOM_MIN_SIBLING = 180; // px each squeezed sibling keeps along the split axis
+
+function applyZoom() {
+  if (!root || !zoomedPane) return;
+  const path = findPath(root, zoomedPane);
+  if (!path || path.length === 0) return; // single pane: nothing to zoom
+
+  // Per-level fraction so the focused pane's total area works out to ~80%
+  // even when the leaf sits under nested splits...
+  const fTarget = Math.pow(ZOOM_SHARE, 1 / path.length);
+
+  let parentEl = grid;
+  for (const { split: node, idx } of path) {
+    const n = node.sizes.length;
+
+    // ...but never squeeze a sibling below ZOOM_MIN_SIBLING px: a terminal
+    // that small shows nothing useful. Measured from the live container, so
+    // a 2x2 grid in a small window zooms less than a side-by-side pair.
+    const container = parentEl.firstElementChild; // the .split div
+    const wraps = container
+      ? Array.from(container.children).filter((el) => el.classList.contains("split-child"))
+      : [];
+    const along = container
+      ? (node.dir === "row" ? container.clientWidth : container.clientHeight) - GUTTER * (n - 1)
+      : 0;
+    let f = fTarget;
+    if (along > 0) {
+      const maxF = (along - ZOOM_MIN_SIBLING * (n - 1)) / along;
+      f = Math.min(fTarget, Math.max(maxF, 1 / n));
+    }
+
+    // Snapshot the pre-zoom sizes once so (a) the pass is idempotent, (b) the
+    // remainder keeps the original sibling ratios, (c) toggle-off can restore.
+    if (!node._savedSizes || node._savedSizes.length !== node.sizes.length) {
+      node._savedSizes = node.sizes.slice();
+    }
+    const base = node._savedSizes;
+    const total = node.sizes.reduce((a, b) => a + b, 0);
+    const baseOthers = base.reduce((a, b) => a + b, 0) - base[idx];
+    const rem = (1 - f) * total;
+    node.sizes[idx] = f * total;
+    for (let j = 0; j < n; j++) {
+      if (j === idx) continue;
+      node.sizes[j] = baseOthers > 0 ? (base[j] / baseOthers) * rem : rem / (n - 1);
+    }
+    parentEl = wraps[idx] || parentEl;
+  }
+  syncSizesAnimated();
+}
+
+// The cap above depends on the window size, so re-measure after a resize.
+let _zoomResizeTimer = null;
+window.addEventListener("resize", () => {
+  if (!zoomedPane) return;
+  clearTimeout(_zoomResizeTimer);
+  _zoomResizeTimer = setTimeout(applyZoom, 120);
+});
+
+// Apply the tree's sizes with the flex-grow transition enabled, dropping the
+// class once the glide is over so drags (and render rebuilds) stay instant.
+let _zoomAnimTimer = null;
+function syncSizesAnimated() {
+  grid.classList.add("zoom-anim");
+  syncSizes(root, grid);
+  clearTimeout(_zoomAnimTimer);
+  _zoomAnimTimer = setTimeout(() => {
+    grid.classList.remove("zoom-anim");
+    // One clean refit per pane at the settled size (see Pane.resize()).
+    collectPanes(root).forEach((p) => p.resize());
+  }, 300);
+}
+
+// Push the tree's sizes into the DOM that render() already built. Each pane's
+// ResizeObserver refits xterm, so no rebuild (and no focus churn) is needed.
+function syncSizes(node, parentEl) {
+  if (node.type === "leaf") return;
+  const container = parentEl.firstElementChild; // the .split div
+  if (!container) return;
+  const wraps = Array.from(container.children).filter((el) =>
+    el.classList.contains("split-child")
+  );
+  node.children.forEach((child, i) => {
+    if (!wraps[i]) return;
+    wraps[i].style.flexGrow = node.sizes[i];
+    syncSizes(child, wraps[i]);
+  });
+}
+
+// Undo the zoom weights everywhere (used when the toggle turns off).
+function restoreSizes(node) {
+  if (node.type === "leaf") return;
+  if (node._savedSizes && node._savedSizes.length === node.sizes.length) {
+    node.sizes = node._savedSizes.slice();
+  }
+  delete node._savedSizes;
+  node.children.forEach(restoreSizes);
+}
+
+// Pin the zoom to `pane` (stealing it from whichever pane held it), or
+// release it when `pane` is already the pinned one.
+function toggleZoomPane(pane) {
+  if (countLeaves(root) < 2) return; // nothing to zoom against
+  zoomedPane = zoomedPane === pane ? null : pane;
+  collectPanes(root).forEach((p) => {
+    const on = p === zoomedPane;
+    p.focusBtn.classList.toggle("active", on);
+    const label = on ? "Restore layout" : "Focus this terminal";
+    p.focusBtn.title = label;
+    p.focusBtn.setAttribute("aria-label", label);
+  });
+  if (zoomedPane) {
+    setActive(zoomedPane);
+    zoomedPane.term.focus();
+    applyZoom();
+  } else {
+    // Only sizes changed (not the tree), so glide back instead of rebuilding.
+    restoreSizes(root);
+    syncSizesAnimated();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Operations: split a pane, close a pane.
 // ---------------------------------------------------------------------------
 function splitPane(pane, dir) {
@@ -534,9 +710,16 @@ function closePane(pane) {
   const hit = findParent(root, pane);
   pane.dispose();
 
+  if (pane === zoomedPane) {
+    // The pinned pane is going away — give the survivors their sizes back.
+    zoomedPane = null;
+    restoreSizes(root);
+  }
+
   if (hit.parent) {
     hit.parent.children.splice(hit.index, 1);
     if (hit.parent.sizes) hit.parent.sizes.splice(hit.index, 1);
+    if (hit.parent._savedSizes) hit.parent._savedSizes.splice(hit.index, 1);
   }
   root = normalize(root);
 
@@ -552,11 +735,57 @@ function closePane(pane) {
 // ---------------------------------------------------------------------------
 let contextMenuEl = null;
 
+// Fill `container` with menu rows. Each item is { label, fn, key?, disabled? }
+// or { separator: true }; `after` runs once an item has been chosen (to
+// close the menu that owns it).
+function buildMenuRows(container, items, after) {
+  items.forEach((it) => {
+    if (it.separator) {
+      const sep = document.createElement("div");
+      sep.className = "context-separator";
+      container.appendChild(sep);
+      return;
+    }
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "ui-btn context-item";
+    row.setAttribute("role", "menuitem");
+    const label = document.createElement("span");
+    label.textContent = it.label;
+    row.appendChild(label);
+    if (it.key) {
+      const key = document.createElement("span");
+      key.className = "context-key";
+      key.textContent = it.key;
+      row.appendChild(key);
+    }
+    if (it.disabled) {
+      row.disabled = true;
+    } else {
+      row.addEventListener("click", () => { after(); it.fn(); });
+    }
+    container.appendChild(row);
+  });
+}
+
+// The split rows are shared by the right-click menu and the ⋮ menu.
+function splitItems(pane) {
+  if (countLeaves(root) >= MAX_PANES) {
+    return [{ label: `Max ${MAX_PANES} terminals per tab`, disabled: true }];
+  }
+  return [
+    { label: "Split left / right", key: SHORTCUTS.splitRow.key, fn: () => splitPane(pane, "row") },
+    { label: "Split top / bottom", key: SHORTCUTS.splitCol.key, fn: () => splitPane(pane, "col") },
+  ];
+}
+
 function showContextMenu(x, y, pane) {
   hideContextMenu();
   const menu = document.createElement("div");
   menu.className = "context-menu";
+  menu.setAttribute("role", "menu");
 
+  const many = countLeaves(root) > 1;
   const items = [];
   // Clipboard first: Copy (only when something is selected) and Paste.
   if (pane.term.hasSelection()) {
@@ -564,36 +793,30 @@ function showContextMenu(x, y, pane) {
   }
   items.push({ label: "Paste", fn: () => pane.paste() });
   items.push({ separator: true });
-  // Splitting adds a terminal, so only offer it while under the per-tab cap.
-  if (countLeaves(root) < MAX_PANES) {
-    items.push({ label: "Split left / right", fn: () => splitPane(pane, "row") });
-    items.push({ label: "Split top / bottom", fn: () => splitPane(pane, "col") });
-  } else {
-    items.push({ label: `Max ${MAX_PANES} terminals per tab`, disabled: true });
+  items.push(...splitItems(pane));
+  // Focus zoom only means something with a sibling to shrink.
+  if (many) {
+    items.push({
+      label: pane === zoomedPane ? "Restore layout" : "Focus this terminal",
+      key: SHORTCUTS.focus.key,
+      fn: () => toggleZoomPane(pane),
+    });
   }
+  items.push({ separator: true });
+  items.push({ label: "Save transcript…", fn: () => pane.saveToFile() });
   // Only offer "Close" when there's more than one terminal.
-  if (collectPanes(root).length > 1) {
-    items.push({ label: "Close terminal", fn: () => closePane(pane) });
-  }
-  items.forEach((it) => {
-    if (it.separator) {
-      const sep = document.createElement("div");
-      sep.className = "context-separator";
-      menu.appendChild(sep);
-      return;
-    }
-    const row = document.createElement("div");
-    row.className = "context-item" + (it.disabled ? " disabled" : "");
-    row.textContent = it.label;
-    if (!it.disabled) {
-      row.addEventListener("click", () => { it.fn(); hideContextMenu(); });
-    }
-    menu.appendChild(row);
-  });
+  if (many) items.push({ label: "Close terminal", fn: () => closePane(pane) });
 
-  menu.style.left = x + "px";
-  menu.style.top = y + "px";
+  buildMenuRows(menu, items, hideContextMenu);
+
   document.body.appendChild(menu);
+  // Clamp so a right-click near the bottom/right edge doesn't push the menu
+  // off-screen (it's position: fixed, so measure after it's in the DOM).
+  const margin = 4;
+  const maxX = window.innerWidth - menu.offsetWidth - margin;
+  const maxY = window.innerHeight - menu.offsetHeight - margin;
+  menu.style.left = Math.max(margin, Math.min(x, maxX)) + "px";
+  menu.style.top = Math.max(margin, Math.min(y, maxY)) + "px";
   contextMenuEl = menu;
 }
 
@@ -640,9 +863,20 @@ function applyLayout(layout) {
 // Ctrl+Shift+L cycles the tab through the presets that hold EXACTLY the
 // terminals it already has, so cycling only rearranges panes — it never
 // spawns or closes a shell (2 panes: side by side <-> stacked, 3 panes:
-// three columns <-> main + two). Uses e.code so it works on any layout.
-function isLayoutCycleKey(e) {
-  return e.ctrlKey && e.shiftKey && !e.altKey && !e.metaKey && e.code === "KeyL";
+// three columns <-> main + two).
+
+// App-wide Ctrl+Shift+<letter> chords. One table so the menus can print the
+// same key beside the same action. Uses e.code so it works on any keyboard
+// layout. (Ctrl+1..9 tab switching lives in tabSwitchIndex().)
+const SHORTCUTS = {
+  splitRow: { code: "KeyD", key: "Ctrl+Shift+D", run: () => activePane && splitPane(activePane, "row") },
+  splitCol: { code: "KeyE", key: "Ctrl+Shift+E", run: () => activePane && splitPane(activePane, "col") },
+  focus: { code: "KeyZ", key: "Ctrl+Shift+Z", run: () => activePane && toggleZoomPane(activePane) },
+  cycleLayout: { code: "KeyL", key: "Ctrl+Shift+L", run: () => cycleLayout() },
+};
+function chordFor(e) {
+  if (!e.ctrlKey || !e.shiftKey || e.altKey || e.metaKey) return null;
+  return Object.values(SHORTCUTS).find((s) => s.code === e.code) || null;
 }
 
 // Do two trees split the screen the same way? (Panes and drag-adjusted
@@ -667,9 +901,10 @@ function cycleLayout() {
 }
 
 window.addEventListener("keydown", (e) => {
-  if (!isLayoutCycleKey(e)) return;
+  const chord = chordFor(e);
+  if (!chord) return;
   e.preventDefault();
-  cycleLayout();
+  chord.run();
 });
 
 // ---------------------------------------------------------------------------
@@ -710,8 +945,10 @@ function buildPicker() {
   if (options.length === 0) options = LAYOUTS;
 
   options.forEach((layout) => {
-    const option = document.createElement("div");
-    option.className = "layout-option";
+    const option = document.createElement("button");
+    option.type = "button";
+    option.className = "ui-btn layout-option";
+    option.setAttribute("aria-label", `${layout.label} layout`);
 
     const mini = document.createElement("div");
     mini.className = "mini-grid";
@@ -730,16 +967,75 @@ function buildPicker() {
 
 function hidePicker() { picker.classList.add("hidden"); }
 
-layoutBtn.addEventListener("click", (e) => {
+// ---------------------------------------------------------------------------
+// ⋮ overflow menu on the right of the tab strip. "Layouts" is its only
+// entry today; new app-wide actions belong here rather than as more buttons.
+// ---------------------------------------------------------------------------
+function hideAppMenu() {
+  const hadFocus = appMenu.contains(document.activeElement);
+  appMenu.classList.add("hidden");
+  menuBtn.classList.remove("open");
+  menuBtn.setAttribute("aria-expanded", "false");
+  // Don't strand keyboard focus on a hidden menu.
+  if (hadFocus && activePane) activePane.term.focus();
+}
+
+function buildAppMenu() {
+  appMenu.innerHTML = "";
+  const n = collectPanes(root).length;
+  const canCycle = LAYOUTS.filter((l) => countLeaves(l.tree) === n).length > 1;
+  const items = [
+    { label: "New tab", fn: newTab },
+    { label: "Rename tab", fn: () => beginRename(current) },
+    { separator: true },
+    ...splitItems(activePane),
+    { label: "Layouts…", fn: () => { buildPicker(); picker.classList.remove("hidden"); } },
+    { label: "Next layout", key: SHORTCUTS.cycleLayout.key, fn: cycleLayout, disabled: !canCycle },
+  ];
+  buildMenuRows(appMenu, items, hideAppMenu);
+}
+
+menuBtn.addEventListener("click", (e) => {
   e.stopPropagation();
-  const opening = picker.classList.contains("hidden");
-  if (opening) buildPicker(); // refresh the list for the current terminal count
-  picker.classList.toggle("hidden");
+  const opening = appMenu.classList.contains("hidden");
+  hidePicker(); // the menu and the picker it opens are never up together
+  if (!opening) return hideAppMenu();
+  buildAppMenu();
+  appMenu.classList.remove("hidden");
+  menuBtn.classList.add("open");
+  menuBtn.setAttribute("aria-expanded", "true");
+  // Land keyboard users on the first row (Tab moves between rows, Escape
+  // closes).
+  const first = appMenu.querySelector(".context-item:not(:disabled)");
+  if (first) first.focus();
 });
 
-// Click elsewhere closes the picker and the right-click menu.
+// Escape closes whichever popover is open. Capture phase so it runs before
+// xterm sees the key, and only swallows the keystroke when something was
+// actually open — otherwise ESC still reaches the shell (vim, etc.).
+window.addEventListener(
+  "keydown",
+  (e) => {
+    if (e.key !== "Escape") return;
+    const open =
+      contextMenuEl ||
+      !appMenu.classList.contains("hidden") ||
+      !picker.classList.contains("hidden");
+    if (!open) return;
+    e.preventDefault();
+    e.stopPropagation();
+    hideContextMenu();
+    hideAppMenu();
+    hidePicker();
+    if (activePane) activePane.term.focus();
+  },
+  true
+);
+
+// Click elsewhere closes the picker, the overflow menu and the right-click menu.
 document.addEventListener("mousedown", (e) => {
-  if (!picker.contains(e.target) && e.target !== layoutBtn) hidePicker();
+  if (!picker.contains(e.target) && !menuBtn.contains(e.target)) hidePicker();
+  if (!appMenu.contains(e.target) && !menuBtn.contains(e.target)) hideAppMenu();
   if (contextMenuEl && !contextMenuEl.contains(e.target)) hideContextMenu();
 });
 
@@ -754,17 +1050,19 @@ function saveTab() {
   if (current < 0) return;
   tabs[current].root = root;
   tabs[current].activePane = activePane;
+  tabs[current].zoomedPane = zoomedPane;
 }
 
 // Make the given tab the active one and mirror it into the globals.
 function loadTab() {
   root = tabs[current].root;
   activePane = tabs[current].activePane;
+  zoomedPane = tabs[current].zoomedPane || null;
 }
 
 function newTab() {
   saveTab();
-  const t = { root: leaf(new Pane()), activePane: null, name: null };
+  const t = { root: leaf(new Pane()), activePane: null, zoomedPane: null, name: null };
   t.activePane = t.root.pane;
   tabs.push(t);
   current = tabs.length - 1;
@@ -830,7 +1128,15 @@ function renderTabs() {
   tabs.forEach((t, i) => {
     const el = document.createElement("div");
     el.className = "tab" + (i === current ? " active" : "");
+    el.setAttribute("role", "tab");
+    el.setAttribute("aria-selected", i === current ? "true" : "false");
+    el.tabIndex = 0;
     el.addEventListener("click", () => onTabClick(i));
+    el.addEventListener("keydown", (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return;
+      e.preventDefault();
+      onTabClick(i); // two quick presses rename, like a double-click
+    });
 
     const title = document.createElement("span");
     title.className = "tab-title";
@@ -838,30 +1144,60 @@ function renderTabs() {
     title.title = "Double-click to rename";
     el.appendChild(title);
 
-    // How many terminals this tab holds (X / 4).
+    // How many terminals this tab holds. Just the number — the cap is a
+    // fixed rule, not per-tab information worth repeating on every tab.
     const count = document.createElement("span");
     count.className = "tab-count";
-    count.textContent = `${countLeaves(t.root)}/${MAX_PANES}`;
+    count.textContent = `${countLeaves(t.root)}`;
+    count.title = `${countLeaves(t.root)} of ${MAX_PANES} terminals`;
     el.appendChild(count);
 
     if (tabs.length > 1) {
-      const x = document.createElement("span");
-      x.className = "tab-close";
-      x.textContent = "✕";
-      x.title = "Close tab";
-      x.addEventListener("click", (e) => { e.stopPropagation(); closeTab(i); });
-      el.appendChild(x);
+      el.appendChild(iconButton("tab-close", "close", "Close tab", () => closeTab(i)));
     }
     tabbar.appendChild(el);
   });
 
-  const add = document.createElement("div");
-  add.className = "tab-add";
-  add.textContent = "+";
-  add.title = "New tab";
-  add.addEventListener("click", newTab);
-  tabbar.appendChild(add);
+  tabbar.appendChild(iconButton("tab-add", "plus", "New tab", newTab));
+
+  revealActiveTab();
+  updateTabFades();
 }
+
+// With many tabs the strip scrolls; make sure the active tab (and, when it's
+// the last one, the + button beside it) is actually on screen.
+function revealActiveTab() {
+  const el = tabbar.children[current];
+  if (!el) return;
+  const target = current === tabs.length - 1 ? tabbar.lastElementChild : el;
+  const strip = tabbar.getBoundingClientRect();
+  const r = target.getBoundingClientRect();
+  if (r.right > strip.right) tabbar.scrollLeft += r.right - strip.right;
+  const r2 = el.getBoundingClientRect();
+  if (r2.left < strip.left) tabbar.scrollLeft -= strip.left - r2.left;
+}
+
+// Fade the edge(s) that have tabs hidden beyond them (see #tabs.can-* CSS).
+function updateTabFades() {
+  const max = tabbar.scrollWidth - tabbar.clientWidth;
+  tabbar.classList.toggle("can-left", tabbar.scrollLeft > 1);
+  tabbar.classList.toggle("can-right", tabbar.scrollLeft < max - 1);
+}
+tabbar.addEventListener("scroll", updateTabFades);
+window.addEventListener("resize", () => { revealActiveTab(); updateTabFades(); });
+
+// A plain vertical wheel over the strip scrolls it sideways (there's no
+// visible scrollbar to grab, and a mouse has no horizontal wheel).
+tabbar.addEventListener(
+  "wheel",
+  (e) => {
+    if (tabbar.scrollWidth <= tabbar.clientWidth) return;
+    if (e.deltaX !== 0) return; // trackpad already scrolls horizontally
+    e.preventDefault();
+    tabbar.scrollLeft += e.deltaY;
+  },
+  { passive: false }
+);
 
 // A single click switches tabs; two quick clicks on the same tab rename it.
 // We detect the double-click ourselves (rather than via the native `dblclick`
@@ -926,7 +1262,9 @@ function beginRename(i) {
 const _render = render;
 render = function () {
   _render();
+  saveTab(); // applyLayout() swaps `root` wholesale; keep the tab record (and its badge) in sync
   renderTabs();
+  applyZoom(); // re-assert focus zoom after any layout change or tab switch
 };
 
 // ---------------------------------------------------------------------------

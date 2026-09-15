@@ -23,6 +23,28 @@
         overflow: hidden;
       }
 
+      /* Every clickable control is a real <button> (keyboard + screen
+         readers); this strips the browser chrome so each styles itself. */
+      .ui-btn {
+        appearance: none;
+        background: none;
+        border: 0;
+        margin: 0;
+        padding: 0;
+        font: inherit;
+        color: inherit;
+        cursor: pointer;
+        text-align: inherit;
+      }
+      .ui-btn:focus-visible { outline: 2px solid #3a78ff; outline-offset: 1px; }
+      /* Tabs live in a clipped scroller, so their ring is drawn inside. */
+      .tab:focus-visible { outline: 2px solid #3a78ff; outline-offset: -2px; }
+      @media (prefers-reduced-motion: reduce) {
+        #grid.zoom-anim .split-child,
+        .pane-btn,
+        .gutter::before { transition: none; }
+      }
+
       /* ---- Browser-style tab strip ---- */
       #tabbar {
         height: 36px;
@@ -30,14 +52,44 @@
         background: #141414;
         display: flex;
         align-items: stretch;
-        justify-content: center;
         padding: 5px 6px 0 6px;
         gap: 4px;
         border-bottom: 1px solid #2a2a2a;
+        overflow: hidden;
+      }
+      /* Mirrors the ⋮ button's footprint on the left so the tabs stay
+         centred in the bar rather than sitting slightly off to one side. */
+      #tabbar::before {
+        content: "";
+        flex: 0 0 30px;
+      }
+
+      /* The tabs themselves live in an inner strip so re-rendering them
+         leaves the ⋮ button alone. It's also the scroller: with many tabs
+         they scroll here, and the ⋮ stays pinned to the right edge.
+         `safe center` keeps the leftmost tab reachable once they overflow. */
+      #tabs {
+        display: flex;
+        flex: 1 1 auto;
+        align-items: stretch;
+        gap: 4px;
+        min-width: 0;
         overflow-x: auto;
         overflow-y: hidden;
+        justify-content: center;
+        justify-content: safe center;
       }
-      #tabbar::-webkit-scrollbar { height: 0; }
+      #tabs::-webkit-scrollbar { height: 0; }
+      /* Fade whichever edge has tabs hidden beyond it (classes set in JS). */
+      #tabs.can-left {
+        mask-image: linear-gradient(to right, transparent, #000 28px);
+      }
+      #tabs.can-right {
+        mask-image: linear-gradient(to left, transparent, #000 28px);
+      }
+      #tabs.can-left.can-right {
+        mask-image: linear-gradient(to right, transparent, #000 28px, #000 calc(100% - 28px), transparent);
+      }
 
       .tab {
         display: flex;
@@ -69,22 +121,23 @@
         outline: none;
       }
       .tab-count {
-        font-size: 10px;
-        color: #777;
+        font-size: 11px;
+        color: #a3a3a3;
         background: #2a2a2a;
         border-radius: 8px;
         padding: 0 5px;
       }
       .tab.active .tab-count { color: #9bb6ff; background: #1a2540; }
       .tab-close {
+        display: flex;
+        align-items: center;
+        justify-content: center;
         color: #888;
         border-radius: 4px;
         width: 16px;
         height: 16px;
-        line-height: 16px;
-        text-align: center;
-        font-size: 11px;
       }
+      .tab-close svg { width: 10px; height: 10px; }
       .tab-close:hover { background: #c0392b; color: #fff; }
       .tab-add {
         display: flex;
@@ -92,40 +145,59 @@
         justify-content: center;
         min-width: 28px;
         color: #ccc;
-        cursor: pointer;
-        font-size: 18px;
         border-radius: 6px;
         margin-bottom: 1px;
       }
-      .tab-add:hover { background: #2a2a2a; }
+      .tab-add svg { width: 14px; height: 14px; }
+      .tab-add:hover { background: #2a2a2a; color: #fff; }
 
-      /* ---- Top toolbar ---- */
-      #toolbar {
-        height: 36px;
-        box-sizing: border-box;
-        background: #1b1b1b;
+      /* ⋮ overflow menu, pinned to the right edge of the tab strip.
+         Its 24px box + 6px of margin = the 30px spacer above. */
+      #menu-btn {
+        align-self: center;
+        flex: 0 0 24px;
         display: flex;
         align-items: center;
-        padding: 0 8px;
-        position: relative;
-        border-bottom: 1px solid #2a2a2a;
-      }
-      #layout-btn {
-        background: #2d2d2d;
-        color: #ddd;
-        border: 1px solid #3d3d3d;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        margin: 0 2px 4px 4px;
+        padding: 0;
+        background: transparent;
+        color: #999;
+        border: none;
         border-radius: 6px;
-        padding: 4px 12px;
         cursor: pointer;
-        font-size: 13px;
       }
-      #layout-btn:hover { background: #3a3a3a; }
+      #menu-btn:hover { background: #2a2a2a; color: #fff; }
+      /* Stays lit while its menu is open. */
+      #menu-btn.open { background: #2a2a2a; color: #fff; }
+
+      /* The menu it drops down: same look as the pane right-click menu. */
+      #app-menu {
+        position: fixed;
+        top: 38px;
+        right: 8px;
+        min-width: 200px;
+        background: #1b1b1b;
+        border: 1px solid #3d3d3d;
+        border-radius: 8px;
+        padding: 4px;
+        z-index: 50;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+        color: #ddd;
+        user-select: none;
+      }
+      #app-menu.hidden { display: none; }
+      /* Focus-zoom resizes glide; the class is only present during a
+         zoom-driven change so gutter drags stay direct. */
+      #grid.zoom-anim .split-child { transition: flex-grow 0.25s ease; }
 
       /* ---- Snap-Layouts-style picker flyout ---- */
       #picker {
-        position: absolute;
-        top: 42px;
-        left: 8px;
+        position: fixed;
+        top: 40px;
+        right: 8px;
         background: #1b1b1b;
         border: 1px solid #3d3d3d;
         border-radius: 10px;
@@ -160,7 +232,7 @@
 
       /* ---- The split-tree of terminal panes ---- */
       #grid {
-        height: calc(100% - 72px);
+        height: calc(100% - 36px);
         display: flex;
         box-sizing: border-box;
       }
@@ -239,28 +311,38 @@
         display: flex;
         flex-direction: column;
         align-items: center;
+        /* `safe center` falls back to start-alignment when the content is
+           taller than the pane, so the top button stays reachable and the
+           overlay scrolls instead of clipping (small split panes). */
         justify-content: center;
+        justify-content: safe center;
         gap: 14px;
+        padding: 16px 12px;
+        box-sizing: border-box;
+        overflow-y: auto;
         z-index: 8;
       }
+      .start-overlay::-webkit-scrollbar { width: 6px; }
+      .start-overlay::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
       .start-title {
         color: #888;
         font-size: 13px;
         margin-bottom: 6px;
       }
       .start-btn {
-        background: #000;
+        background: #1b1b1b;
         color: #fff;
-        border: 1px solid #fff;
-        border-radius: 0;
-        padding: 11px 22px;
+        border: 1px solid #3d3d3d;
+        border-radius: 8px;
+        padding: 10px 22px;
         font-size: 14px;
         min-width: 260px;
         cursor: pointer;
         font-family: inherit;
-        box-shadow: 4px 4px 0 0 #fff;
+        transition: background 0.1s, border-color 0.1s;
       }
-      .start-btn:hover { background: #111; }
+      .start-btn:hover { background: #222; border-color: #3a78ff; }
+      .start-btn:focus-visible { outline: 2px solid #3a78ff; outline-offset: 1px; }
       .start-btn:disabled { opacity: 0.5; cursor: default; }
       /* The real folder path shown beneath the "This directory" label. */
       .start-btn-path {
@@ -287,11 +369,11 @@
       }
       .recent-list.hidden { display: none; }
       .recent-item {
-        background: #000;
+        background: #141414;
         color: #ddd;
-        border: 1px solid #444;
-        border-radius: 0;
-        padding: 7px 12px;
+        border: 1px solid #2e2e2e;
+        border-radius: 6px;
+        padding: 6px 8px 6px 12px;
         font-size: 12px;
         font-family: "Cascadia Mono", Consolas, monospace;
         cursor: pointer;
@@ -300,7 +382,7 @@
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-      .recent-item:hover { border-color: #fff; color: #fff; }
+      .recent-item:hover { background: #1f1f1f; border-color: #555; color: #fff; }
 
       /* ---- Saved folders section (filled by the `save` command) ---- */
       .saved-section {
@@ -321,64 +403,59 @@
       .saved-item { display: flex; align-items: center; gap: 8px; }
       .saved-item-path {
         flex: 1;
+        min-width: 0;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
       }
       .saved-remove {
         flex: 0 0 auto;
-        color: #888;
-        font-size: 11px;
-        line-height: 1;
-        padding: 2px 4px;
-        border-radius: 4px;
-      }
-      .saved-remove:hover { background: #c0392b; color: #fff; }
-
-      /* ✕ close button, shown when hovering a pane */
-      .pane-close {
-        position: absolute;
-        top: 4px;
-        right: 6px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         width: 18px;
         height: 18px;
-        line-height: 18px;
-        text-align: center;
+        color: #888;
+        border-radius: 4px;
+      }
+      .saved-remove svg { width: 10px; height: 10px; }
+      .saved-remove:hover { background: #c0392b; color: #fff; }
+
+      /* Pane tool strip: focus / save / close, tucked into the top-right
+         corner. The strip is a small hot zone — the buttons only appear
+         while the pointer (or keyboard focus) is in that corner, so merely
+         hovering the pane never paints icons over the first line of output. */
+      .pane-tools {
+        position: absolute;
+        top: 0;
+        right: 0;
+        display: flex;
+        gap: 4px;
+        padding: 4px 6px 6px 8px;
+        z-index: 5;
+      }
+      .pane-btn {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
         color: #999;
         background: rgba(40, 40, 40, 0.7);
         border-radius: 4px;
-        font-size: 12px;
-        cursor: pointer;
-        z-index: 5;
         opacity: 0;
         transition: opacity 0.1s;
       }
-      .pane:hover .pane-close { opacity: 1; }
+      .pane-btn svg { display: block; width: 12px; height: 12px; }
+      .pane-tools:hover .pane-btn,
+      .pane-tools:focus-within .pane-btn { opacity: 1; }
+      .pane-btn:hover { background: #2d6cdf; color: #fff; }
       .pane-close:hover { background: #c0392b; color: #fff; }
-      /* When there's only one terminal, you can't close it — hide the ✕. */
-      #grid.single .pane-close { display: none; }
-
-      /* 💾 save-to-file button, sits just left of the ✕ (same hover behavior) */
-      .pane-save {
-        position: absolute;
-        top: 4px;
-        right: 28px;
-        width: 18px;
-        height: 18px;
-        line-height: 18px;
-        text-align: center;
-        background: rgba(40, 40, 40, 0.7);
-        border-radius: 4px;
-        font-size: 11px;
-        cursor: pointer;
-        z-index: 5;
-        opacity: 0;
-        transition: opacity 0.1s;
-      }
-      .pane:hover .pane-save { opacity: 1; }
-      .pane-save:hover { background: #2d6cdf; }
-      /* With one terminal the ✕ is hidden, so move save into its spot. */
-      #grid.single .pane-save { right: 6px; }
+      /* The pinned pane keeps its focus button lit as a "you're zoomed" cue. */
+      .pane-focus.active { opacity: 1; background: #3a78ff; color: #fff; }
+      /* A lone terminal can't be closed or zoomed — hide those two. */
+      #grid.single .pane-close,
+      #grid.single .pane-focus { display: none; }
 
       /* Right-click menu */
       .context-menu {
@@ -392,18 +469,27 @@
         min-width: 160px;
       }
       .context-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 24px;
+        width: 100%;
+        box-sizing: border-box;
         padding: 6px 12px;
         color: #ddd;
         font-size: 13px;
         border-radius: 5px;
         cursor: pointer;
+        text-align: left;
+        white-space: nowrap;
       }
-      .context-item:hover { background: #3a78ff; color: #fff; }
-      .context-item.disabled {
-        color: #666;
-        cursor: default;
-      }
-      .context-item.disabled:hover { background: transparent; color: #666; }
+      .context-item:hover,
+      .context-item:focus-visible { background: #3a78ff; color: #fff; outline: none; }
+      .context-key { color: #888; font-size: 11px; }
+      .context-item:hover .context-key,
+      .context-item:focus-visible .context-key { color: #d6e0ff; }
+      .context-item:disabled { color: #666; cursor: default; }
+      .context-item:disabled:hover { background: transparent; color: #666; }
       .context-separator {
         height: 1px;
         margin: 4px 6px;
@@ -414,12 +500,22 @@
 
   <body>
     <!-- Browser-style tabs; each tab is an independent set of terminals -->
-    <div id="tabbar"></div>
-
-    <div id="toolbar">
-      <button id="layout-btn">&#x229e; Layouts</button>
-      <div id="picker" class="hidden"></div>
+    <div id="tabbar">
+      <div id="tabs" role="tablist" aria-label="Terminal tabs"></div>
+      <button id="menu-btn" class="ui-btn" title="Menu" aria-label="Menu"
+              aria-haspopup="menu" aria-controls="app-menu" aria-expanded="false">
+        <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
+          <circle cx="8" cy="3" r="1.4" />
+          <circle cx="8" cy="8" r="1.4" />
+          <circle cx="8" cy="13" r="1.4" />
+        </svg>
+      </button>
     </div>
+
+    <!-- Drops down from the ⋮ button; its rows are built in renderer.js. -->
+    <div id="app-menu" class="hidden" role="menu"></div>
+
+    <div id="picker" class="hidden"></div>
 
     <!-- The split-tree of terminal panes is built inside here -->
     <div id="grid"></div>
